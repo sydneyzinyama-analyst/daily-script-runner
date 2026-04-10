@@ -235,8 +235,8 @@ def main():
     import os
     BOT_TOKEN = os.getenv("BOT_TOKEN")
     CHAT_ID = os.getenv("CHAT_ID")
-    FIXTURES_URL = "https://www.flashscore.co.za/team/slavia-sofia/UopPSUlp/fixtures/"
-    NUM_FIXTURES = 1
+    FIXTURES_URL = "https://www.flashscore.co.za/"
+    NUM_FIXTURES = 100
     HEADLESS = True
 
     print("[INFO] Starting Flashscore alert script...")
