@@ -125,6 +125,37 @@ class FlashscoreGoalsScraper:
             print(f"[ERROR] Failed to load results: {e}")
             return False
 
+    def expand_hidden_matches(self):
+        try:
+            while True:
+                btns = self.page.locator("text=/display matches/i")
+                count = btns.count()
+
+                if count == 0:
+                    break
+
+                clicked = 0
+
+                for i in range(count):
+                    try:
+                        btn = btns.nth(i)
+
+                        if btn.is_visible():
+                            btn.click(timeout=5000)
+                            clicked += 1
+                            time.sleep(0.3)
+
+                    except Exception as e:
+                        print(f"[WARN] Skipping button {i}:", e)
+
+                if clicked == 0:
+                    break
+
+                time.sleep(1)
+
+        except Exception as e:
+            print("[WARN] expand_hidden_matches failed:", e)
+
     def get_last_6_matches(self):
         try:
             self.page.mouse.wheel(0, 4000)
@@ -236,7 +267,7 @@ def main():
     BOT_TOKEN = os.getenv("BOT_TOKEN")
     CHAT_ID = os.getenv("CHAT_ID")
     FIXTURES_URL = "https://www.flashscore.co.za/"
-    NUM_FIXTURES = 100
+    NUM_FIXTURES = 300
     HEADLESS = True
 
     print("[INFO] Starting Flashscore alert script...")
@@ -247,18 +278,35 @@ def main():
         scraper.page.goto(FIXTURES_URL, wait_until="load", timeout=90000)
         time.sleep(3)
 
-        links = scraper.page.locator("a[href*='/match/'][href*='?mid=']").all()
         matches = []
         seen = set()
-        for l in links:
-            href = l.get_attribute("href")
-            if not href: continue
-            href = href.split("/tv")[0].split("#")[0]
-            full_url = "https://www.flashscore.co.za" + href if href.startswith("/") else href
-            if full_url not in seen:
-                matches.append(full_url)
-                seen.add(full_url)
-            if len(matches) >= NUM_FIXTURES: break
+        tries = 0
+
+        while len(matches) < NUM_FIXTURES and tries < 40:
+
+            scraper.expand_hidden_matches()
+
+            links = scraper.page.locator("a[href*='/match/'][href*='?mid=']").all()
+
+            for l in links:
+                href = l.get_attribute("href")
+                if not href:
+                    continue
+
+                href = href.split("/tv")[0].split("#")[0]
+                full_url = "https://www.flashscore.co.za" + href if href.startswith("/") else href
+
+                if full_url not in seen:
+                    matches.append(full_url)
+                    seen.add(full_url)
+
+                if len(matches) >= NUM_FIXTURES:
+                    break
+
+            scraper.page.mouse.wheel(0, 6000)
+            time.sleep(2)
+
+            tries += 1
 
         print(f"[INFO] Found {len(matches)} upcoming matches")
 
@@ -281,7 +329,6 @@ def main():
             print(f"[INFO] {home} avg goals: {avg_home}")
             print(f"[INFO] {away} avg goals: {avg_away}")
 
-            # ALERT CONDITIONS
             condition1 = (avg_home < 0.7 and avg_away < 0.7)
             condition2 = ((avg_home >= 1.75 and avg_away < 1) or (avg_away >= 1.75 and avg_home < 1))
 
