@@ -2,7 +2,7 @@ name: Flashscore Daily Alert
 
 on:
   schedule:
-    - cron: "0 1 * * *"   # runs daily at 3:00 AM South Africa time
+    - cron: "0 23 * * *"   # runs daily at 1:00 AM South Africa time
   workflow_dispatch:
 
 jobs:
