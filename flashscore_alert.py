@@ -329,10 +329,10 @@ def main():
             print(f"[INFO] {home} avg goals: {avg_home}")
             print(f"[INFO] {away} avg goals: {avg_away}")
 
-            condition1 = (avg_home < 0.7 and avg_away < 0.7)
+            
             condition2 = ((avg_home >= 1.75 and avg_away < 1) or (avg_away >= 1.75 and avg_home < 1))
 
-            if condition1 or condition2:
+            if condition2:
                 msg = f"⚠️ Alert: {home} vs {away}\nAvg Goals: {avg_home} - {avg_away}\nMatch URL: {m_url}"
                 print("[INFO] Sending Telegram alert...")
                 scraper.send_telegram_message(msg, BOT_TOKEN, CHAT_ID)
