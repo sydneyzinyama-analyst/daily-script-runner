@@ -1,3 +1,4 @@
+import os
 from playwright.sync_api import sync_playwright
 from urllib.parse import urlparse
 from difflib import SequenceMatcher
@@ -5,7 +6,6 @@ import time
 import re
 import unicodedata
 import requests
-import os
 
 
 # ---------------- SCRAPER CLASS ----------------
@@ -355,8 +355,9 @@ class FlashscoreGoalsScraper:
                     total_xg += r["away_xg"]
                     counted += 1
 
-        avg_xg = total_xg / counted if counted else 0
-        return round(avg_xg, 2)
+        if counted == 0:
+            return None
+        return round(total_xg / counted, 2)
 
     def calculate_team_xga(self, results):
         total_xga = 0
@@ -376,8 +377,9 @@ class FlashscoreGoalsScraper:
                     total_xga += r["home_xg"]
                     counted += 1
 
-        avg_xga = total_xga / counted if counted else 0
-        return round(avg_xga, 2)
+        if counted == 0:
+            return None
+        return round(total_xga / counted, 2)
 
     def analyze_team(self, team_url):
         if not self.open_team_results(team_url):
@@ -400,7 +402,11 @@ class FlashscoreGoalsScraper:
         avg_xga = self.calculate_team_xga(results)
 
         avg_gd = round(stats["avg_goals"] - avg_gc, 2)
-        avg_xgd = round(avg_xg - avg_xga, 2)
+
+        if avg_xg is not None and avg_xga is not None:
+            avg_xgd = round(avg_xg - avg_xga, 2)
+        else:
+            avg_xgd = None
 
         stats.update({
             "avg_gc": avg_gc,
@@ -436,17 +442,17 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
     h_gc = hs.get("avg_gc", 0)
     a_gc = as_.get("avg_gc", 0)
 
-    h_xg = hs.get("avg_xg", 0)
-    a_xg = as_.get("avg_xg", 0)
-
-    h_xga = hs.get("avg_xga", 0)
-    a_xga = as_.get("avg_xga", 0)
-
-    h_xgd = hs.get("avg_xgd", 0)
-    a_xgd = as_.get("avg_xgd", 0)
-
     h_gd = hs.get("avg_gd", 0)
     a_gd = as_.get("avg_gd", 0)
+
+    h_xg = hs.get("avg_xg")
+    a_xg = as_.get("avg_xg")
+
+    h_xga = hs.get("avg_xga")
+    a_xga = as_.get("avg_xga")
+
+    h_xgd = hs.get("avg_xgd")
+    a_xgd = as_.get("avg_xgd")
 
     positive = []
     warnings = []
@@ -458,30 +464,40 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
         if text not in warnings:
             warnings.append(text)
 
+    use_xg = (
+        h_xg is not None and a_xg is not None and
+        h_xga is not None and a_xga is not None and
+        h_xgd is not None and a_xgd is not None
+    )
+
     # 1. High scoring team vs weak defence
     over_trigger = (
         (h_g >= 2.0 and a_gc >= 1.5) or
-        (a_g >= 2.0 and h_gc >= 1.5) or
-        (h_xg >= 1.8 and a_xga >= 1.6) or
-        (a_xg >= 1.8 and h_xga >= 1.6)
+        (a_g >= 2.0 and h_gc >= 1.5)
     )
+    if use_xg:
+        over_trigger = over_trigger or (
+            (h_xg >= 1.8 and a_xga >= 1.6) or
+            (a_xg >= 1.8 and h_xga >= 1.6)
+        )
     if over_trigger:
         add_positive(30, "Over Goals market: Over 2.5 (and possibly 3.5 if the edge is strong)")
 
     # 2. xG dominance mismatch
-    if h_xgd >= 0.7 and a_xgd <= -0.3:
-        add_positive(15, f"{home} to win / home handicap angle")
-    elif a_xgd >= 0.7 and h_xgd <= -0.3:
-        add_positive(15, f"{away} to win / away handicap angle")
+    if use_xg:
+        if h_xgd >= 0.7 and a_xgd <= -0.3:
+            add_positive(15, f"{home} to win / home handicap angle")
+        elif a_xgd >= 0.7 and h_xgd <= -0.3:
+            add_positive(15, f"{away} to win / away handicap angle")
 
     # 3. False strong attack filter
-    if h_g >= 2.0 and h_xg <= 1.5:
+    if h_g >= 2.0 and (h_xg is not None and h_xg <= 1.5):
         add_warning(f"{home} may be overperforming its finishing (caution on backing them blindly)")
-    if a_g >= 2.0 and a_xg <= 1.5:
+    if a_g >= 2.0 and (a_xg is not None and a_xg <= 1.5):
         add_warning(f"{away} may be overperforming its finishing (caution on backing them blindly)")
 
     # 4. Both teams aggressive
-    if (
+    if use_xg and (
         h_xg >= 1.6 and
         a_xg >= 1.6 and
         h_xga >= 1.2 and
@@ -490,7 +506,7 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
         add_positive(10, "BTTS + Over 2.5 goals")
 
     # 5. Low tempo / Under goals
-    if (
+    if use_xg and (
         h_xg <= 1.2 and
         a_xg <= 1.2 and
         h_xga <= 1.3 and
@@ -499,16 +515,22 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
         add_positive(5, "Under 2.5 goals / Under 3.5 goals")
 
     # 6. Defensive collapse detection
-    if h_gc >= 1.8 or h_xga >= 1.8:
+    if h_gc >= 1.8:
         add_warning(f"{home} defensive weakness: opponent scoring chances look high")
-    if a_gc >= 1.8 or a_xga >= 1.8:
+    if a_gc >= 1.8:
         add_warning(f"{away} defensive weakness: opponent scoring chances look high")
 
     # 7. Pure dominance filter
-    if h_xgd >= 0.8 and a_xgd <= -0.5 and h_g >= 1.8:
-        add_positive(1, f"Strong home win signal for {home}")
-    elif a_xgd >= 0.8 and h_xgd <= -0.5 and a_g >= 1.8:
-        add_positive(1, f"Strong away win signal for {away}")
+    if use_xg:
+        if h_xgd >= 0.8 and a_xgd <= -0.5 and h_g >= 1.8:
+            add_positive(1, f"Strong home win signal for {home}")
+        elif a_xgd >= 0.8 and h_xgd <= -0.5 and a_g >= 1.8:
+            add_positive(1, f"Strong away win signal for {away}")
+    else:
+        if h_gd >= 1.0 and a_gd <= -0.5 and h_g >= 1.8:
+            add_positive(1, f"Strong home win signal for {home}")
+        elif a_gd >= 1.0 and h_gd <= -0.5 and a_g >= 1.8:
+            add_positive(1, f"Strong away win signal for {away}")
 
     if not positive:
         return None
@@ -517,12 +539,15 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
     best_signal = positive[0][1]
     all_signals = [text for _, text in positive]
 
+    def fmt(v):
+        return "N/A" if v is None else str(v)
+
     message = (
         f"⚽ {home} vs {away}\n\n"
         f"Best signal: {best_signal}\n\n"
         f"📊 Team stats\n"
-        f"{home}  Goals: {h_g} | Conceded: {h_gc} | GD: {h_gd} | xG: {h_xg} | xGA: {h_xga} | xGD: {h_xgd}\n"
-        f"{away}  Goals: {a_g} | Conceded: {a_gc} | GD: {a_gd} | xG: {a_xg} | xGA: {a_xga} | xGD: {a_xgd}\n\n"
+        f"{home}  Goals: {h_g} | Conceded: {h_gc} | GD: {h_gd} | xG: {fmt(h_xg)} | xGA: {fmt(h_xga)} | xGD: {fmt(h_xgd)}\n"
+        f"{away}  Goals: {a_g} | Conceded: {a_gc} | GD: {a_gd} | xG: {fmt(a_xg)} | xGA: {fmt(a_xga)} | xGD: {fmt(a_xgd)}\n\n"
         f"Signals:\n"
         + "\n".join(f"- {s}" for s in all_signals)
     )
@@ -536,11 +561,15 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
 
 # ---------------- ALERT SCRIPT ----------------
 def main():
-    BOT_TOKEN = os.getenv("BOT_TOKEN")
-    CHAT_ID = os.getenv("CHAT_ID")
+    BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+    CHAT_ID = os.getenv("CHAT_ID", "").strip()
     FIXTURES_URL = "https://www.flashscore.co.za/"
-    NUM_FIXTURES = 300
+    NUM_FIXTURES = 1
     HEADLESS = True
+
+    if not BOT_TOKEN or not CHAT_ID:
+        print("[ERROR] BOT_TOKEN or CHAT_ID is missing from environment variables.")
+        return
 
     print("[INFO] Starting Flashscore alert script...")
     scraper = FlashscoreGoalsScraper(headless=HEADLESS)
