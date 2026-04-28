@@ -564,7 +564,7 @@ def main():
     BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
     CHAT_ID = os.getenv("CHAT_ID", "").strip()
     FIXTURES_URL = "https://www.flashscore.co.za/"
-    NUM_FIXTURES = 1
+    NUM_FIXTURES = 350
     HEADLESS = True
 
     if not BOT_TOKEN or not CHAT_ID:
