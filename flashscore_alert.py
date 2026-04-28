@@ -538,7 +538,7 @@ def main():
     BOT_TOKEN = os.getenv("BOT_TOKEN")
     CHAT_ID = os.getenv("CHAT_ID")
     FIXTURES_URL = "https://www.flashscore.co.za/"
-    NUM_FIXTURES = 1
+    NUM_FIXTURES = 300
     HEADLESS = True
 
     print("[INFO] Starting Flashscore alert script...")
