@@ -5,6 +5,7 @@ import time
 import re
 import unicodedata
 import requests
+import os
 
 
 # ---------------- SCRAPER CLASS ----------------
