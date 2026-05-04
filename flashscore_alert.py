@@ -431,13 +431,16 @@ class FlashscoreGoalsScraper:
             pass
 
 
-# ---------------- SIGNAL ENGINE (STRONG WIN ONLY) ----------------
+# ---------------- SIGNAL ENGINE ----------------
 def evaluate_bet_signals(home, away, home_data, away_data, m_url):
     hs = home_data["stats"]
     as_ = away_data["stats"]
 
     h_g = hs.get("avg_goals", 0)
     a_g = as_.get("avg_goals", 0)
+
+    h_gc = hs.get("avg_gc", 0)
+    a_gc = as_.get("avg_gc", 0)
 
     h_gd = hs.get("avg_gd", 0)
     a_gd = as_.get("avg_gd", 0)
@@ -451,42 +454,97 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
     h_xgd = hs.get("avg_xgd")
     a_xgd = as_.get("avg_xgd")
 
+    positive = []
+    warnings = []
+
+    def add_positive(priority, text):
+        positive.append((priority, text))
+
+    def add_warning(text):
+        if text not in warnings:
+            warnings.append(text)
+
     use_xg = (
         h_xg is not None and a_xg is not None and
         h_xga is not None and a_xga is not None and
         h_xgd is not None and a_xgd is not None
     )
 
-    best_signal = None
 
-    # STRONG WIN SIGNALS ONLY
+
+    # 2. xG dominance mismatch
+    if use_xg:
+        if h_xgd >= 0.7 and a_xgd <= -0.3:
+            add_positive(15, f"{home} to win / home handicap angle")
+        elif a_xgd >= 0.7 and h_xgd <= -0.3:
+            add_positive(15, f"{away} to win / away handicap angle")
+
+    # 3. False strong attack filter
+    if h_g >= 2.0 and (h_xg is not None and h_xg <= 1.5):
+        add_warning(f"{home} may be overperforming its finishing (caution on backing them blindly)")
+    if a_g >= 2.0 and (a_xg is not None and a_xg <= 1.5):
+        add_warning(f"{away} may be overperforming its finishing (caution on backing them blindly)")
+
+    # 4. Both teams aggressive
+    if use_xg and (
+        h_xg >= 1.6 and
+        a_xg >= 1.6 and
+        h_xga >= 1.2 and
+        a_xga >= 1.2
+    ):
+        add_positive(10, "BTTS + Over 2.5 goals")
+
+    # 5. Low tempo / Under goals
+    if use_xg and (
+        h_xg <= 1.2 and
+        a_xg <= 1.2 and
+        h_xga <= 1.3 and
+        a_xga <= 1.3
+    ):
+        add_positive(5, "Under 2.5 goals / Under 3.5 goals")
+
+    # 6. Defensive collapse detection
+    if h_gc >= 1.8:
+        add_warning(f"{home} defensive weakness: opponent scoring chances look high")
+    if a_gc >= 1.8:
+        add_warning(f"{away} defensive weakness: opponent scoring chances look high")
+
+    # 7. Pure dominance filter
     if use_xg:
         if h_xgd >= 0.8 and a_xgd <= -0.5 and h_g >= 1.8:
-            best_signal = f"Strong home win signal for {home}"
+            add_positive(1, f"Strong home win signal for {home}")
         elif a_xgd >= 0.8 and h_xgd <= -0.5 and a_g >= 1.8:
-            best_signal = f"Strong away win signal for {away}"
+            add_positive(1, f"Strong away win signal for {away}")
     else:
         if h_gd >= 1.0 and a_gd <= -0.5 and h_g >= 1.8:
-            best_signal = f"Strong home win signal for {home}"
+            add_positive(1, f"Strong home win signal for {home}")
         elif a_gd >= 1.0 and h_gd <= -0.5 and a_g >= 1.8:
-            best_signal = f"Strong away win signal for {away}"
+            add_positive(1, f"Strong away win signal for {away}")
 
-    if not best_signal:
+    if not positive:
         return None
+
+    positive.sort(key=lambda x: x[0])
+    best_signal = positive[0][1]
+    all_signals = [text for _, text in positive]
 
     def fmt(v):
         return "N/A" if v is None else str(v)
 
     message = (
-        f"🏆 STRONG WIN ALERT\n\n"
         f"⚽ {home} vs {away}\n\n"
-        f"Signal: {best_signal}\n\n"
-        f"📊 Team stats (last 6 matches)\n"
-        f"{home}  Goals: {h_g} | GD: {h_gd} | xG: {fmt(h_xg)} | xGA: {fmt(h_xga)} | xGD: {fmt(h_xgd)}\n"
-        f"{away}  Goals: {a_g} | GD: {a_gd} | xG: {fmt(a_xg)} | xGA: {fmt(a_xga)} | xGD: {fmt(a_xgd)}\n\n"
-        f"Match URL: {m_url}"
+        f"Best signal: {best_signal}\n\n"
+        f"📊 Team stats\n"
+        f"{home}  Goals: {h_g} | Conceded: {h_gc} | GD: {h_gd} | xG: {fmt(h_xg)} | xGA: {fmt(h_xga)} | xGD: {fmt(h_xgd)}\n"
+        f"{away}  Goals: {a_g} | Conceded: {a_gc} | GD: {a_gd} | xG: {fmt(a_xg)} | xGA: {fmt(a_xga)} | xGD: {fmt(a_xgd)}\n\n"
+        f"Signals:\n"
+        + "\n".join(f"- {s}" for s in all_signals)
     )
 
+    if warnings:
+        message += "\n\nCautions:\n" + "\n".join(f"- {w}" for w in warnings)
+
+    message += f"\n\nMatch URL: {m_url}"
     return message
 
 
@@ -495,7 +553,7 @@ def main():
     BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
     CHAT_ID = os.getenv("CHAT_ID", "").strip()
     FIXTURES_URL = "https://www.flashscore.co.za/"
-    NUM_FIXTURES = 350
+    NUM_FIXTURES = 1
     HEADLESS = True
 
     if not BOT_TOKEN or not CHAT_ID:
@@ -565,7 +623,7 @@ def main():
                 print(msg)
                 scraper.send_telegram_message(msg, BOT_TOKEN, CHAT_ID)
             else:
-                print("[INFO] No strong win signals found.")
+                print("[INFO] No signals found.")
 
     except Exception as e:
         print("[ERROR]", e)
