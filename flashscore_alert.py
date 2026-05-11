@@ -581,7 +581,7 @@ def main():
 
     BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
     CHAT_ID = os.getenv("CHAT_ID", "").strip()
-    FIXTURES_URL = "https://www.flashscore.co.za/soccer/iraq/stars-league/fixtures/"
+    FIXTURES_URL = "https://www.flashscore.co.za/"
     HEADLESS = True
 
     if not BOT_TOKEN or not CHAT_ID:
