@@ -8,6 +8,7 @@ on:
 jobs:
   run-alert:
     runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       matrix:
