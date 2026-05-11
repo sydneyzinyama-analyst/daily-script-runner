@@ -8,6 +8,10 @@ on:
 jobs:
   run-alert:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        batch: [0,1,2,3,4,5,6,7,8,9,10,11,12]
 
     steps:
       - name: Checkout code
@@ -28,4 +32,6 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-        run: python flashscore_alert.py
+        run: |
+          START=$(( ${{ matrix.batch }} * 100 ))
+          python flashscore_alert.py --start $START --limit 100
