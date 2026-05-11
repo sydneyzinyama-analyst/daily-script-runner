@@ -9,6 +9,16 @@ import unicodedata
 import requests
 
 
+# ---------------- JOB STATUS TELEGRAM ----------------
+def send_job_status(message, bot_token, chat_id):
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": message}
+        requests.post(url, data=payload, timeout=20)
+    except:
+        pass
+
+
 # ---------------- SCRAPER CLASS ----------------
 class FlashscoreGoalsScraper:
     def __init__(self, headless=True):
@@ -571,15 +581,22 @@ def main():
 
     BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
     CHAT_ID = os.getenv("CHAT_ID", "").strip()
-    FIXTURES_URL = "https://www.flashscore.co.za/"
+    FIXTURES_URL = "https://www.flashscore.co.za/soccer/iraq/stars-league/fixtures/"
     HEADLESS = True
 
     if not BOT_TOKEN or not CHAT_ID:
         print("[ERROR] BOT_TOKEN or CHAT_ID is missing from environment variables.")
         return
 
+    send_job_status(
+        f"🚀 Job STARTED\nBatch START={START} LIMIT={LIMIT}",
+        BOT_TOKEN,
+        CHAT_ID
+    )
+
     print("[INFO] Starting Flashscore alert script...")
     print(f"[INFO] Batch start={START}, limit={LIMIT}")
+
     scraper = FlashscoreGoalsScraper(headless=HEADLESS)
 
     try:
@@ -595,6 +612,11 @@ def main():
 
         if not batch_matches:
             print("[INFO] No matches in this batch. Exiting.")
+            send_job_status(
+                f"⚠️ Job FINISHED (No matches)\nBatch START={START} LIMIT={LIMIT}",
+                BOT_TOKEN,
+                CHAT_ID
+            )
             return
 
         for idx, m_url in enumerate(batch_matches, start=START + 1):
@@ -624,8 +646,20 @@ def main():
             else:
                 print("[INFO] No signals found.")
 
+        send_job_status(
+            f"✅ Job FINISHED\nBatch START={START} LIMIT={LIMIT}",
+            BOT_TOKEN,
+            CHAT_ID
+        )
+
     except Exception as e:
         print("[ERROR]", e)
+        send_job_status(
+            f"❌ Job FAILED\nBatch START={START} LIMIT={LIMIT}\nError: {str(e)}",
+            BOT_TOKEN,
+            CHAT_ID
+        )
+
     finally:
         print("[INFO] Closing browser...")
         scraper.close()
