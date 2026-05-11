@@ -552,8 +552,8 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
 def main():
     BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
     CHAT_ID = os.getenv("CHAT_ID", "").strip()
-    FIXTURES_URL = "https://www.flashscore.co.za/soccer/thailand/thai-league-1/fixtures/#/KnDY5T7C/standings/overall/"
-    NUM_FIXTURES = 8
+    FIXTURES_URL = "https://www.flashscore.co.za/soccer/iraq/stars-league/fixtures/"
+    NUM_FIXTURES = 5
     HEADLESS = True
 
     if not BOT_TOKEN or not CHAT_ID:
