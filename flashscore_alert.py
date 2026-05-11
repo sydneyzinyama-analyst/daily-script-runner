@@ -1,4 +1,5 @@
 import os
+import argparse
 from playwright.sync_api import sync_playwright
 from urllib.parse import urlparse
 from difflib import SequenceMatcher
@@ -70,18 +71,19 @@ class FlashscoreGoalsScraper:
 
     def _safe_text(self, selector):
         try:
-            loc = self.page.locator(selector).first
+            loc = self.page.locator(selector)
             if loc.count() > 0:
-                return loc.inner_text().strip()
+                text = loc.first.inner_text().strip()
+                return text
         except:
             pass
         return ""
 
     def _safe_attr(self, selector, attr_name="href"):
         try:
-            loc = self.page.locator(selector).first
+            loc = self.page.locator(selector)
             if loc.count() > 0:
-                val = loc.get_attribute(attr_name)
+                val = loc.first.get_attribute(attr_name)
                 if val:
                     return val
         except:
@@ -97,9 +99,9 @@ class FlashscoreGoalsScraper:
         ]
         for selector in selectors:
             try:
-                loc = self.page.locator(selector).first
+                loc = self.page.locator(selector)
                 if loc.count() > 0:
-                    text = loc.inner_text().strip()
+                    text = loc.first.inner_text().strip()
                     if text:
                         text = re.sub(r"^Soccer:\s*", "", text, flags=re.IGNORECASE)
                         text = re.sub(r"\s+results?\s*$", "", text, flags=re.IGNORECASE)
@@ -155,25 +157,41 @@ class FlashscoreGoalsScraper:
         except Exception as e:
             print("[WARN] expand_hidden_matches failed:", e)
 
-    def get_last_6_matches(self):
-        try:
-            self.page.mouse.wheel(0, 4000)
-            time.sleep(2)
-        except:
-            pass
-
+    def discover_matches(self, target_count, max_tries=250):
         matches = []
-        links = self.page.locator("a[href*='/match/'][href*='?mid=']").all()
-        for link in links:
-            href = link.get_attribute("href")
-            if not href:
-                continue
-            href = href.split("/tv")[0].split("#")[0]
-            full_url = self._abs_url(href)
-            if full_url not in matches and "?mid=" in full_url:
-                matches.append(full_url)
-            if len(matches) == 6:
+        seen = set()
+        tries = 0
+
+        while len(matches) < target_count and tries < max_tries:
+            self.expand_hidden_matches()
+
+            links = self.page.locator("a[href*='/match/'][href*='?mid=']").all()
+            for link in links:
+                href = link.get_attribute("href")
+                if not href:
+                    continue
+
+                href = href.split("/tv")[0].split("#")[0]
+                full_url = self._abs_url(href)
+
+                if full_url not in seen and "?mid=" in full_url:
+                    matches.append(full_url)
+                    seen.add(full_url)
+
+                if len(matches) >= target_count:
+                    break
+
+            if len(matches) >= target_count:
                 break
+
+            try:
+                self.page.mouse.wheel(0, 6000)
+            except:
+                pass
+
+            time.sleep(2)
+            tries += 1
+
         return matches
 
     def get_match_teams_and_links(self, match_url):
@@ -385,7 +403,7 @@ class FlashscoreGoalsScraper:
         if not self.open_team_results(team_url):
             return None
 
-        matches = self.get_last_6_matches()
+        matches = self.discover_matches(6)
         results = []
 
         for url in matches:
@@ -470,22 +488,17 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
         h_xgd is not None and a_xgd is not None
     )
 
-
-
-    # 2. xG dominance mismatch
     if use_xg:
         if h_xgd >= 0.7 and a_xgd <= -0.3:
             add_positive(15, f"{home} to win / home handicap angle")
         elif a_xgd >= 0.7 and h_xgd <= -0.3:
             add_positive(15, f"{away} to win / away handicap angle")
 
-    # 3. False strong attack filter
     if h_g >= 2.0 and (h_xg is not None and h_xg <= 1.5):
         add_warning(f"{home} may be overperforming its finishing (caution on backing them blindly)")
     if a_g >= 2.0 and (a_xg is not None and a_xg <= 1.5):
         add_warning(f"{away} may be overperforming its finishing (caution on backing them blindly)")
 
-    # 4. Both teams aggressive
     if use_xg and (
         h_xg >= 1.6 and
         a_xg >= 1.6 and
@@ -494,7 +507,6 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
     ):
         add_positive(10, "BTTS + Over 2.5 goals")
 
-    # 5. Low tempo / Under goals
     if use_xg and (
         h_xg <= 1.2 and
         a_xg <= 1.2 and
@@ -503,13 +515,11 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
     ):
         add_positive(5, "Under 2.5 goals / Under 3.5 goals")
 
-    # 6. Defensive collapse detection
     if h_gc >= 1.8:
         add_warning(f"{home} defensive weakness: opponent scoring chances look high")
     if a_gc >= 1.8:
         add_warning(f"{away} defensive weakness: opponent scoring chances look high")
 
-    # 7. Pure dominance filter
     if use_xg:
         if h_xgd >= 0.8 and a_xgd <= -0.5 and h_g >= 1.8:
             add_positive(1, f"Strong home win signal for {home}")
@@ -550,10 +560,18 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
 
 # ---------------- ALERT SCRIPT ----------------
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start", type=int, default=0)
+    parser.add_argument("--limit", type=int, default=100)
+    args = parser.parse_args()
+
+    START = max(0, args.start)
+    LIMIT = max(1, args.limit)
+    TARGET_COUNT = START + LIMIT
+
     BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
     CHAT_ID = os.getenv("CHAT_ID", "").strip()
-    FIXTURES_URL = "https://www.flashscore.co.za/soccer/iraq/stars-league/fixtures/"
-    NUM_FIXTURES = 5
+    FIXTURES_URL = "https://www.flashscore.co.za/"
     HEADLESS = True
 
     if not BOT_TOKEN or not CHAT_ID:
@@ -561,6 +579,7 @@ def main():
         return
 
     print("[INFO] Starting Flashscore alert script...")
+    print(f"[INFO] Batch start={START}, limit={LIMIT}")
     scraper = FlashscoreGoalsScraper(headless=HEADLESS)
 
     try:
@@ -568,37 +587,17 @@ def main():
         scraper.page.goto(FIXTURES_URL, wait_until="load", timeout=90000)
         time.sleep(3)
 
-        matches = []
-        seen = set()
-        tries = 0
+        matches = scraper.discover_matches(TARGET_COUNT)
+        print(f"[INFO] Found {len(matches)} upcoming matches total")
 
-        while len(matches) < NUM_FIXTURES and tries < 40:
-            scraper.expand_hidden_matches()
+        batch_matches = matches[START:START + LIMIT]
+        print(f"[INFO] This job will process {len(batch_matches)} matches from {START} to {START + LIMIT - 1}")
 
-            links = scraper.page.locator("a[href*='/match/'][href*='?mid=']").all()
+        if not batch_matches:
+            print("[INFO] No matches in this batch. Exiting.")
+            return
 
-            for l in links:
-                href = l.get_attribute("href")
-                if not href:
-                    continue
-
-                href = href.split("/tv")[0].split("#")[0]
-                full_url = "https://www.flashscore.co.za" + href if href.startswith("/") else href
-
-                if full_url not in seen:
-                    matches.append(full_url)
-                    seen.add(full_url)
-
-                if len(matches) >= NUM_FIXTURES:
-                    break
-
-            scraper.page.mouse.wheel(0, 6000)
-            time.sleep(2)
-            tries += 1
-
-        print(f"[INFO] Found {len(matches)} upcoming matches")
-
-        for idx, m_url in enumerate(matches, start=1):
+        for idx, m_url in enumerate(batch_matches, start=START + 1):
             print(f"[INFO] Processing match {idx}: {m_url}")
             fixture = scraper.get_match_teams_and_links(m_url)
 
