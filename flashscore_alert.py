@@ -498,11 +498,7 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
         h_xgd is not None and a_xgd is not None
     )
 
-    if use_xg:
-        if h_xgd >= 0.7 and a_xgd <= -0.3:
-            add_positive(15, f"{home} to win / home handicap angle")
-        elif a_xgd >= 0.7 and h_xgd <= -0.3:
-            add_positive(15, f"{away} to win / away handicap angle")
+    
 
     if h_g >= 2.0 and (h_xg is not None and h_xg <= 1.5):
         add_warning(f"{home} may be overperforming its finishing (caution on backing them blindly)")
