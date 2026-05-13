@@ -498,23 +498,21 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
         h_xgd is not None and a_xgd is not None
     )
 
-    
-
     if h_g >= 2.0 and (h_xg is not None and h_xg <= 1.5):
         add_warning(f"{home} may be overperforming its finishing (caution on backing them blindly)")
     if a_g >= 2.0 and (a_xg is not None and a_xg <= 1.5):
         add_warning(f"{away} may be overperforming its finishing (caution on backing them blindly)")
 
     if use_xg:
-    low_attack = h_xg <= 1.0 and a_xg <= 1.0
-    very_solid_defense = h_xga <= 1.2 and a_xga <= 1.2
-    tight_matchup = abs(h_xgd - a_xgd) <= 0.5
+        low_attack = h_xg <= 1.0 and a_xg <= 1.0
+        very_solid_defense = h_xga <= 1.2 and a_xga <= 1.2
+        tight_matchup = abs(h_xgd - a_xgd) <= 0.5
 
-    if low_attack and very_solid_defense and tight_matchup:
-        add_positive(
-            8,
-            f"Strong low-goal signal: likely Under 2.5 / Under 3.5"
-        )
+        if low_attack and very_solid_defense and tight_matchup:
+            add_positive(
+                8,
+                f"Strong low-goal signal: likely Under 2.5 / Under 3.5"
+            )
 
     if h_gc >= 1.8:
         add_warning(f"{home} defensive weakness: opponent scoring chances look high")
