@@ -519,15 +519,51 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
     if a_gc >= 1.8:
         add_warning(f"{away} defensive weakness: opponent scoring chances look high")
 
+    # Stronger home/away win logic with a direct gap check
     if use_xg:
-        if h_xgd >= 0.8 and a_xgd <= -0.5 and h_g >= 1.8:
+        home_metric = h_xgd
+        away_metric = a_xgd
+        strong_cutoff = 0.8
+        gap = home_metric - away_metric if home_metric is not None and away_metric is not None else None
+
+        if (
+            home_metric is not None and away_metric is not None and
+            gap is not None and
+            home_metric >= strong_cutoff and
+            away_metric <= -0.5 and
+            gap >= 1.3 and
+            h_g >= 1.8
+        ):
             add_positive(1, f"Strong home win signal for {home}")
-        elif a_xgd >= 0.8 and h_xgd <= -0.5 and a_g >= 1.8:
+
+        elif (
+            home_metric is not None and away_metric is not None and
+            gap is not None and
+            away_metric >= strong_cutoff and
+            home_metric <= -0.5 and
+            (-gap) >= 1.3 and
+            a_g >= 1.8
+        ):
             add_positive(1, f"Strong away win signal for {away}")
     else:
-        if h_gd >= 1.0 and a_gd <= -0.5 and h_g >= 1.8:
+        home_metric = h_gd
+        away_metric = a_gd
+        strong_cutoff = 1.0
+        gap = home_metric - away_metric
+
+        if (
+            home_metric >= strong_cutoff and
+            away_metric <= -0.5 and
+            gap >= 1.3 and
+            h_g >= 1.8
+        ):
             add_positive(1, f"Strong home win signal for {home}")
-        elif a_gd >= 1.0 and h_gd <= -0.5 and a_g >= 1.8:
+        elif (
+            away_metric >= strong_cutoff and
+            home_metric <= -0.5 and
+            (-gap) >= 1.3 and
+            a_g >= 1.8
+        ):
             add_positive(1, f"Strong away win signal for {away}")
 
     if not positive:
