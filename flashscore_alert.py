@@ -40,10 +40,7 @@ class FlashscoreGoalsScraper:
     def send_telegram_message(self, message, bot_token, chat_id):
         try:
             url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-            payload = {
-                "chat_id": chat_id,
-                "text": message
-            }
+            payload = {"chat_id": chat_id, "text": message}
             r = requests.post(url, data=payload, timeout=20)
             if r.status_code != 200:
                 print("[WARN] Telegram error:", r.text)
@@ -498,11 +495,13 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
         h_xgd is not None and a_xgd is not None
     )
 
+    # --- Overperformance warnings ---
     if h_g >= 2.0 and (h_xg is not None and h_xg <= 1.5):
         add_warning(f"{home} may be overperforming its finishing (caution on backing them blindly)")
     if a_g >= 2.0 and (a_xg is not None and a_xg <= 1.5):
         add_warning(f"{away} may be overperforming its finishing (caution on backing them blindly)")
 
+    # --- Low goal / Under signals ---
     if use_xg:
         low_attack = h_xg <= 1.0 and a_xg <= 1.0
         very_solid_defense = h_xga <= 1.2 and a_xga <= 1.2
@@ -514,58 +513,50 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
                 f"Strong low-goal signal: likely Under 2.5 / Under 3.5"
             )
 
+    # --- Defensive weakness warnings ---
     if h_gc >= 1.8:
         add_warning(f"{home} defensive weakness: opponent scoring chances look high")
     if a_gc >= 1.8:
         add_warning(f"{away} defensive weakness: opponent scoring chances look high")
 
-    # Stronger home/away win logic with a direct gap check
+    # ---------------- STRONG HOME WIN LOGIC ONLY ----------------
     if use_xg:
         home_metric = h_xgd
         away_metric = a_xgd
-        strong_cutoff = 0.8
         gap = home_metric - away_metric if home_metric is not None and away_metric is not None else None
 
         if (
             home_metric is not None and away_metric is not None and
             gap is not None and
-            home_metric >= strong_cutoff and
-            away_metric <= -0.5 and
-            gap >= 1.3 and
-            h_g >= 1.8
+            home_metric >= 0.9 and
+            away_metric <= -0.7 and
+            gap >= 1.6 and
+            h_g >= 1.8 and
+            h_gc <= 1.1 and
+            a_g <= 1.2 and
+            a_gc >= 1.6 and
+            h_xga <= 1.3 and
+            a_xga >= 1.4
         ):
-            add_positive(1, f"Strong home win signal for {home}")
+            add_positive(1, f"Very strong home win signal for {home}")
 
-        elif (
-            home_metric is not None and away_metric is not None and
-            gap is not None and
-            away_metric >= strong_cutoff and
-            home_metric <= -0.5 and
-            (-gap) >= 1.3 and
-            a_g >= 1.8
-        ):
-            add_positive(1, f"Strong away win signal for {away}")
     else:
         home_metric = h_gd
         away_metric = a_gd
-        strong_cutoff = 1.0
         gap = home_metric - away_metric
 
         if (
-            home_metric >= strong_cutoff and
-            away_metric <= -0.5 and
-            gap >= 1.3 and
-            h_g >= 1.8
+            home_metric >= 1.2 and
+            away_metric <= -0.8 and
+            gap >= 1.8 and
+            h_g >= 1.8 and
+            h_gc <= 1.1 and
+            a_g <= 1.2 and
+            a_gc >= 1.6
         ):
-            add_positive(1, f"Strong home win signal for {home}")
-        elif (
-            away_metric >= strong_cutoff and
-            home_metric <= -0.5 and
-            (-gap) >= 1.3 and
-            a_g >= 1.8
-        ):
-            add_positive(1, f"Strong away win signal for {away}")
+            add_positive(1, f"Very strong home win signal for {home}")
 
+    # ---------------- FINAL OUTPUT ----------------
     if not positive:
         return None
 
