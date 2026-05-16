@@ -479,10 +479,6 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
     h_xgd = hs.get("avg_xgd")
     a_xgd = as_.get("avg_xgd")
 
-    # Games played (used for sample size guard)
-    h_games = hs.get("matches", 0)
-    a_games = as_.get("matches", 0)
-
     positive = []
     warnings = []
 
@@ -533,24 +529,20 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
             home_metric is not None and away_metric is not None and
             gap is not None and
 
-            # --- Sample size guard ---
-            h_games >= 8 and
-            a_games >= 8 and
-
             # --- xG Dominance ---
-            home_metric >= 1.3 and          # home must be genuinely elite in xGD
-            away_metric <= -1.1 and         # away must be badly negative
-            gap >= 2.4 and                  # combined gap must be massive
+            home_metric >= 1.3 and
+            away_metric <= -1.1 and
+            gap >= 2.4 and
 
             # --- Goals scored ---
-            h_g >= 2.1 and                  # home must be prolific
-            h_gc <= 0.85 and                # home must have near-elite defence
-            a_g <= 0.95 and                 # away attack must be toothless
-            a_gc >= 1.9 and                 # away must be leaking heavily
+            h_g >= 2.1 and
+            h_gc <= 0.85 and
+            a_g <= 0.95 and
+            a_gc >= 1.9 and
 
             # --- xGA ---
-            h_xga <= 1.05 and               # home rarely allows quality chances
-            a_xga >= 1.75                   # away gives up chances freely
+            h_xga <= 1.05 and
+            a_xga >= 1.75
         ):
             add_positive(1, f"NEAR-GUARANTEED home win signal for {home}")
 
@@ -560,18 +552,13 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
         gap = home_metric - away_metric
 
         if (
-            # --- Sample size guard ---
-            h_games >= 8 and
-            a_games >= 8 and
-
-            home_metric >= 1.8 and          # was 1.2
-            away_metric <= -1.3 and         # was -0.8
-            gap >= 2.8 and                  # was 1.8
-
-            h_g >= 2.1 and                  # was 1.8
-            h_gc <= 0.85 and                # was 1.1
-            a_g <= 0.95 and                 # was 1.2
-            a_gc >= 1.9                     # was 1.6
+            home_metric >= 1.8 and
+            away_metric <= -1.3 and
+            gap >= 2.8 and
+            h_g >= 2.1 and
+            h_gc <= 0.85 and
+            a_g <= 0.95 and
+            a_gc >= 1.9
         ):
             add_positive(1, f"NEAR-GUARANTEED home win signal for {home}")
 
