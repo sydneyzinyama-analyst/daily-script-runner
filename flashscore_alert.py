@@ -479,6 +479,10 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
     h_xgd = hs.get("avg_xgd")
     a_xgd = as_.get("avg_xgd")
 
+    # Games played (used for sample size guard)
+    h_games = hs.get("matches", 0)
+    a_games = as_.get("matches", 0)
+
     positive = []
     warnings = []
 
@@ -519,7 +523,7 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
     if a_gc >= 1.8:
         add_warning(f"{away} defensive weakness: opponent scoring chances look high")
 
-    # ---------------- STRONG HOME WIN LOGIC ONLY ----------------
+    # ---------------- NEAR-GUARANTEED HOME WIN LOGIC ----------------
     if use_xg:
         home_metric = h_xgd
         away_metric = a_xgd
@@ -528,17 +532,27 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
         if (
             home_metric is not None and away_metric is not None and
             gap is not None and
-            home_metric >= 0.9 and
-            away_metric <= -0.7 and
-            gap >= 1.6 and
-            h_g >= 1.8 and
-            h_gc <= 1.1 and
-            a_g <= 1.2 and
-            a_gc >= 1.6 and
-            h_xga <= 1.3 and
-            a_xga >= 1.4
+
+            # --- Sample size guard ---
+            h_games >= 8 and
+            a_games >= 8 and
+
+            # --- xG Dominance ---
+            home_metric >= 1.3 and          # home must be genuinely elite in xGD
+            away_metric <= -1.1 and         # away must be badly negative
+            gap >= 2.4 and                  # combined gap must be massive
+
+            # --- Goals scored ---
+            h_g >= 2.1 and                  # home must be prolific
+            h_gc <= 0.85 and                # home must have near-elite defence
+            a_g <= 0.95 and                 # away attack must be toothless
+            a_gc >= 1.9 and                 # away must be leaking heavily
+
+            # --- xGA ---
+            h_xga <= 1.05 and               # home rarely allows quality chances
+            a_xga >= 1.75                   # away gives up chances freely
         ):
-            add_positive(1, f"Very strong home win signal for {home}")
+            add_positive(1, f"NEAR-GUARANTEED home win signal for {home}")
 
     else:
         home_metric = h_gd
@@ -546,15 +560,20 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
         gap = home_metric - away_metric
 
         if (
-            home_metric >= 1.2 and
-            away_metric <= -0.8 and
-            gap >= 1.8 and
-            h_g >= 1.8 and
-            h_gc <= 1.1 and
-            a_g <= 1.2 and
-            a_gc >= 1.6
+            # --- Sample size guard ---
+            h_games >= 8 and
+            a_games >= 8 and
+
+            home_metric >= 1.8 and          # was 1.2
+            away_metric <= -1.3 and         # was -0.8
+            gap >= 2.8 and                  # was 1.8
+
+            h_g >= 2.1 and                  # was 1.8
+            h_gc <= 0.85 and                # was 1.1
+            a_g <= 0.95 and                 # was 1.2
+            a_gc >= 1.9                     # was 1.6
         ):
-            add_positive(1, f"Very strong home win signal for {home}")
+            add_positive(1, f"NEAR-GUARANTEED home win signal for {home}")
 
     # ---------------- FINAL OUTPUT ----------------
     if not positive:
