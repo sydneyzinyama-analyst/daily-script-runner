@@ -519,7 +519,7 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
     if a_gc >= 1.8:
         add_warning(f"{away} defensive weakness: opponent scoring chances look high")
 
-    # ---------------- NEAR-GUARANTEED HOME WIN LOGIC ----------------
+    # ---------------- HIGH-CONFIDENCE HOME WIN LOGIC ----------------
     if use_xg:
         home_metric = h_xgd
         away_metric = a_xgd
@@ -529,22 +529,22 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
             home_metric is not None and away_metric is not None and
             gap is not None and
 
-            # --- xG Dominance ---
-            home_metric >= 1.3 and
-            away_metric <= -1.1 and
-            gap >= 2.4 and
+            # --- xG dominance (slightly looser) ---
+            home_metric >= 1.0 and
+            away_metric <= -0.8 and
+            gap >= 1.8 and
 
-            # --- Goals scored ---
-            h_g >= 2.1 and
-            h_gc <= 0.85 and
-            a_g <= 0.95 and
-            a_gc >= 1.9 and
+            # --- Goals scored / conceded ---
+            h_g >= 1.8 and
+            h_gc <= 1.1 and
+            a_g <= 1.2 and
+            a_gc >= 1.6 and
 
             # --- xGA ---
-            h_xga <= 1.05 and
-            a_xga >= 1.75
+            h_xga <= 1.25 and
+            a_xga >= 1.55
         ):
-            add_positive(1, f"NEAR-GUARANTEED home win signal for {home}")
+            add_positive(1, f"HIGH-CONFIDENCE home win signal for {home}")
 
     else:
         home_metric = h_gd
@@ -552,15 +552,15 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
         gap = home_metric - away_metric
 
         if (
-            home_metric >= 1.8 and
-            away_metric <= -1.3 and
-            gap >= 2.8 and
-            h_g >= 2.1 and
-            h_gc <= 0.85 and
-            a_g <= 0.95 and
-            a_gc >= 1.9
+            home_metric >= 1.3 and
+            away_metric <= -0.9 and
+            gap >= 2.0 and
+            h_g >= 1.8 and
+            h_gc <= 1.1 and
+            a_g <= 1.2 and
+            a_gc >= 1.6
         ):
-            add_positive(1, f"NEAR-GUARANTEED home win signal for {home}")
+            add_positive(1, f"HIGH-CONFIDENCE home win signal for {home}")
 
     # ---------------- FINAL OUTPUT ----------------
     if not positive:
