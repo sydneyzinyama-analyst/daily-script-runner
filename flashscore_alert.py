@@ -623,7 +623,7 @@ def main():
 
     try:
         print(f"[INFO] Opening fixtures page: {FIXTURES_URL}")
-        scraper.page.goto(FIXTURES_URL, wait_until="load", timeout=90000)
+        scraper.page.goto(FIXTURES_URL, wait_until="load", timeout=80000)
         time.sleep(3)
 
         matches = scraper.discover_matches(TARGET_COUNT)
