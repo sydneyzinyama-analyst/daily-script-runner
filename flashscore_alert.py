@@ -457,6 +457,70 @@ class FlashscoreGoalsScraper:
 
 
 # ---------------- SIGNAL ENGINE ----------------
+# Win-score weighting: dominance gap (8) + goal/conceded corroboration (4) + xGA (2) = 14 max.
+MAX_WIN_SCORE = 14
+HIGH_WIN_THRESHOLD = 9
+MODERATE_WIN_THRESHOLD = 6
+
+
+def _win_score(fav_gd, dog_gd, fav_g, fav_gc, dog_g, dog_gc, fav_xga, dog_xga):
+    """Points toward fav beating dog. gd/xga args are None-safe; dog/fav args use the
+    same metric family (both GD or both xGD) so a partial xG match doesn't mix scales."""
+    score = 0.0
+
+    if fav_gd >= 1.5:
+        score += 3
+    elif fav_gd >= 1.0:
+        score += 2
+    elif fav_gd >= 0.5:
+        score += 1
+
+    if dog_gd <= -1.2:
+        score += 3
+    elif dog_gd <= -0.8:
+        score += 2
+    elif dog_gd <= -0.4:
+        score += 1
+
+    gap = fav_gd - dog_gd
+    if gap >= 2.5:
+        score += 2
+    elif gap >= 1.8:
+        score += 1
+
+    if fav_g >= 2.0:
+        score += 1
+    elif fav_g >= 1.8:
+        score += 0.5
+
+    if fav_gc <= 0.9:
+        score += 1
+    elif fav_gc <= 1.1:
+        score += 0.5
+
+    if dog_g <= 1.0:
+        score += 1
+    elif dog_g <= 1.2:
+        score += 0.5
+
+    if dog_gc >= 1.8:
+        score += 1
+    elif dog_gc >= 1.6:
+        score += 0.5
+
+    if fav_xga is not None and fav_xga <= 1.0:
+        score += 1
+    elif fav_xga is not None and fav_xga <= 1.25:
+        score += 0.5
+
+    if dog_xga is not None and dog_xga >= 1.8:
+        score += 1
+    elif dog_xga is not None and dog_xga >= 1.55:
+        score += 0.5
+
+    return score
+
+
 def evaluate_bet_signals(home, away, home_data, away_data, m_url):
     hs = home_data["stats"]
     as_ = away_data["stats"]
@@ -501,66 +565,48 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
     if a_g >= 2.0 and (a_xg is not None and a_xg <= 1.5):
         add_warning(f"{away} may be overperforming its finishing (caution on backing them blindly)")
 
-    # --- Low goal / Under signals ---
-    if use_xg:
-        low_attack = h_xg <= 1.0 and a_xg <= 1.0
-        very_solid_defense = h_xga <= 1.2 and a_xga <= 1.2
-        tight_matchup = abs(h_xgd - a_xgd) <= 0.5
-
-        if low_attack and very_solid_defense and tight_matchup:
-            add_positive(
-                8,
-                f"Strong low-goal signal: likely Under 2.5 / Under 3.5"
-            )
-
     # --- Defensive weakness warnings ---
     if h_gc >= 1.8:
         add_warning(f"{home} defensive weakness: opponent scoring chances look high")
     if a_gc >= 1.8:
         add_warning(f"{away} defensive weakness: opponent scoring chances look high")
 
-    # ---------------- HIGH-CONFIDENCE HOME WIN LOGIC ----------------
+    # ---------------- WIN SIGNALS (scored, tiered) ----------------
+    fav_metric_h, dog_metric_h = (h_xgd, a_xgd) if use_xg else (h_gd, a_gd)
+    fav_metric_a, dog_metric_a = (a_xgd, h_xgd) if use_xg else (a_gd, h_gd)
+    h_xga_arg, a_xga_arg = (h_xga, a_xga) if use_xg else (None, None)
+
+    home_win_score = _win_score(
+        fav_metric_h, dog_metric_h, h_g, h_gc, a_g, a_gc, h_xga_arg, a_xga_arg
+    )
+    away_win_score = _win_score(
+        fav_metric_a, dog_metric_a, a_g, a_gc, h_g, h_gc, a_xga_arg, h_xga_arg
+    )
+
+    if home_win_score >= HIGH_WIN_THRESHOLD:
+        add_positive(1, f"HIGH-CONFIDENCE home win signal for {home} (score {home_win_score:.1f}/{MAX_WIN_SCORE})")
+    elif home_win_score >= MODERATE_WIN_THRESHOLD:
+        add_positive(2, f"Moderate home win signal for {home} (score {home_win_score:.1f}/{MAX_WIN_SCORE})")
+
+    if away_win_score >= HIGH_WIN_THRESHOLD:
+        add_positive(1, f"HIGH-CONFIDENCE away win signal for {away} (score {away_win_score:.1f}/{MAX_WIN_SCORE})")
+    elif away_win_score >= MODERATE_WIN_THRESHOLD:
+        add_positive(2, f"Moderate away win signal for {away} (score {away_win_score:.1f}/{MAX_WIN_SCORE})")
+
+    # --- Low goal / Under signals (tiered by how many conditions hold) ---
     if use_xg:
-        home_metric = h_xgd
-        away_metric = a_xgd
-        gap = home_metric - away_metric if home_metric is not None and away_metric is not None else None
+        conditions_met = 0
+        if h_xg <= 1.0 and a_xg <= 1.0:
+            conditions_met += 1
+        if h_xga <= 1.2 and a_xga <= 1.2:
+            conditions_met += 1
+        if abs(h_xgd - a_xgd) <= 0.5:
+            conditions_met += 1
 
-        if (
-            home_metric is not None and away_metric is not None and
-            gap is not None and
-
-            # --- xG dominance (slightly looser) ---
-            home_metric >= 1.0 and
-            away_metric <= -0.8 and
-            gap >= 1.8 and
-
-            # --- Goals scored / conceded ---
-            h_g >= 1.8 and
-            h_gc <= 1.1 and
-            a_g <= 1.2 and
-            a_gc >= 1.6 and
-
-            # --- xGA ---
-            h_xga <= 1.25 and
-            a_xga >= 1.55
-        ):
-            add_positive(1, f"HIGH-CONFIDENCE home win signal for {home}")
-
-    else:
-        home_metric = h_gd
-        away_metric = a_gd
-        gap = home_metric - away_metric
-
-        if (
-            home_metric >= 1.3 and
-            away_metric <= -0.9 and
-            gap >= 2.0 and
-            h_g >= 1.8 and
-            h_gc <= 1.1 and
-            a_g <= 1.2 and
-            a_gc >= 1.6
-        ):
-            add_positive(1, f"HIGH-CONFIDENCE home win signal for {home}")
+        if conditions_met == 3:
+            add_positive(3, "Strong low-goal signal: likely Under 2.5")
+        elif conditions_met == 2:
+            add_positive(4, "Moderate low-goal signal: lean Under 3.5")
 
     # ---------------- FINAL OUTPUT ----------------
     if not positive:
