@@ -459,8 +459,7 @@ class FlashscoreGoalsScraper:
 # ---------------- SIGNAL ENGINE ----------------
 # Win-score weighting: dominance gap (8) + goal/conceded corroboration (4) + xGA (2) = 14 max.
 MAX_WIN_SCORE = 14
-HIGH_WIN_THRESHOLD = 9
-MODERATE_WIN_THRESHOLD = 6
+HIGH_WIN_THRESHOLD = 10
 
 
 def _win_score(fav_gd, dog_gd, fav_g, fav_gc, dog_g, dog_gc, fav_xga, dog_xga):
@@ -585,28 +584,22 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
 
     if home_win_score >= HIGH_WIN_THRESHOLD:
         add_positive(1, f"HIGH-CONFIDENCE home win signal for {home} (score {home_win_score:.1f}/{MAX_WIN_SCORE})")
-    elif home_win_score >= MODERATE_WIN_THRESHOLD:
-        add_positive(2, f"Moderate home win signal for {home} (score {home_win_score:.1f}/{MAX_WIN_SCORE})")
 
     if away_win_score >= HIGH_WIN_THRESHOLD:
         add_positive(1, f"HIGH-CONFIDENCE away win signal for {away} (score {away_win_score:.1f}/{MAX_WIN_SCORE})")
-    elif away_win_score >= MODERATE_WIN_THRESHOLD:
-        add_positive(2, f"Moderate away win signal for {away} (score {away_win_score:.1f}/{MAX_WIN_SCORE})")
 
     # --- Low goal / Under signals (tiered by how many conditions hold) ---
     if use_xg:
         conditions_met = 0
-        if h_xg <= 1.0 and a_xg <= 1.0:
+        if h_xg <= 0.9 and a_xg <= 0.9:
             conditions_met += 1
-        if h_xga <= 1.2 and a_xga <= 1.2:
+        if h_xga <= 1.1 and a_xga <= 1.1:
             conditions_met += 1
-        if abs(h_xgd - a_xgd) <= 0.5:
+        if abs(h_xgd - a_xgd) <= 0.4:
             conditions_met += 1
 
         if conditions_met == 3:
             add_positive(3, "Strong low-goal signal: likely Under 2.5")
-        elif conditions_met == 2:
-            add_positive(4, "Moderate low-goal signal: lean Under 3.5")
 
     # ---------------- FINAL OUTPUT ----------------
     if not positive:
