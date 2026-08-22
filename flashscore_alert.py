@@ -571,22 +571,16 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
         add_warning(f"{away} defensive weakness: opponent scoring chances look high")
 
     # ---------------- WIN SIGNALS (scored, tiered) ----------------
+    # Home only: away-win alerts have been removed.
     fav_metric_h, dog_metric_h = (h_xgd, a_xgd) if use_xg else (h_gd, a_gd)
-    fav_metric_a, dog_metric_a = (a_xgd, h_xgd) if use_xg else (a_gd, h_gd)
     h_xga_arg, a_xga_arg = (h_xga, a_xga) if use_xg else (None, None)
 
     home_win_score = _win_score(
         fav_metric_h, dog_metric_h, h_g, h_gc, a_g, a_gc, h_xga_arg, a_xga_arg
     )
-    away_win_score = _win_score(
-        fav_metric_a, dog_metric_a, a_g, a_gc, h_g, h_gc, a_xga_arg, h_xga_arg
-    )
 
     if home_win_score >= HIGH_WIN_THRESHOLD:
         add_positive(1, f"HIGH-CONFIDENCE home win signal for {home} (score {home_win_score:.1f}/{MAX_WIN_SCORE})")
-
-    if away_win_score >= HIGH_WIN_THRESHOLD:
-        add_positive(1, f"HIGH-CONFIDENCE away win signal for {away} (score {away_win_score:.1f}/{MAX_WIN_SCORE})")
 
     # --- Low goal / Under signals (tiered by how many conditions hold) ---
     if use_xg:
