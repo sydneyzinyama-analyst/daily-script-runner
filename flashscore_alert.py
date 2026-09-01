@@ -1,3 +1,4 @@
+```python
 import os
 import argparse
 from playwright.sync_api import sync_playwright
@@ -208,10 +209,19 @@ class FlashscoreGoalsScraper:
         except:
             return None
 
-        home_name = self._safe_text(".duelParticipant__home .participant__participantName a")
-        away_name = self._safe_text(".duelParticipant__away .participant__participantName a")
-        home_href = self._safe_attr(".duelParticipant__home .participant__participantName a", "href")
-        away_href = self._safe_attr(".duelParticipant__away .participant__participantName a", "href")
+        home_name = self._safe_text(
+            ".duelParticipant__home .participant__participantName a"
+        )
+        away_name = self._safe_text(
+            ".duelParticipant__away .participant__participantName a"
+        )
+
+        home_href = self._safe_attr(
+            ".duelParticipant__home .participant__participantName a", "href"
+        )
+        away_href = self._safe_attr(
+            ".duelParticipant__away .participant__participantName a", "href"
+        )
 
         return {
             "home_name": home_name,
@@ -225,52 +235,95 @@ class FlashscoreGoalsScraper:
         try:
             if "?mid=" not in match_url:
                 return None
+
             base = match_url.split("?mid=")[0]
             mid = match_url.split("?mid=")[1]
+
             return f"{base}summary/stats/overall/?mid={mid}"
+
         except:
             return None
 
     def get_match_xg(self, match_url):
         stats_url = self.get_match_stats_url(match_url)
+
         if not stats_url:
-            return {"home_xg": None, "away_xg": None, "match_url": match_url}
+            return {
+                "home_xg": None,
+                "away_xg": None,
+                "match_url": match_url
+            }
 
         try:
-            self.page.goto(stats_url, wait_until="networkidle", timeout=90000)
+            self.page.goto(
+                stats_url,
+                wait_until="networkidle",
+                timeout=90000
+            )
             time.sleep(3)
+
         except:
-            return {"home_xg": None, "away_xg": None, "match_url": match_url}
+            return {
+                "home_xg": None,
+                "away_xg": None,
+                "match_url": match_url
+            }
 
         try:
-            rows = self.page.locator("[data-testid='wcl-statistics']").all()
+            rows = self.page.locator(
+                "[data-testid='wcl-statistics']"
+            ).all()
 
             for row in rows:
                 try:
-                    label = row.locator("[data-testid='wcl-statistics-category']").inner_text().strip()
+                    label = row.locator(
+                        "[data-testid='wcl-statistics-category']"
+                    ).inner_text().strip()
 
                     if "Expected goals" in label:
-                        values = row.locator("[data-testid='wcl-statistics-value'] span").all()
+                        values = row.locator(
+                            "[data-testid='wcl-statistics-value'] span"
+                        ).all()
+
                         if len(values) >= 2:
-                            home_xg = float(values[0].inner_text().strip())
-                            away_xg = float(values[1].inner_text().strip())
+                            home_xg = float(
+                                values[0].inner_text().strip()
+                            )
+                            away_xg = float(
+                                values[1].inner_text().strip()
+                            )
+
                             return {
                                 "home_xg": home_xg,
                                 "away_xg": away_xg,
                                 "match_url": match_url
                             }
+
                 except:
                     continue
 
-            return {"home_xg": None, "away_xg": None, "match_url": match_url}
+            return {
+                "home_xg": None,
+                "away_xg": None,
+                "match_url": match_url
+            }
 
         except:
-            return {"home_xg": None, "away_xg": None, "match_url": match_url}
+            return {
+                "home_xg": None,
+                "away_xg": None,
+                "match_url": match_url
+            }
 
     def get_match_goals(self, match_url):
         try:
-            self.page.goto(match_url, wait_until="networkidle", timeout=90000)
+            self.page.goto(
+                match_url,
+                wait_until="networkidle",
+                timeout=90000
+            )
             time.sleep(3)
+
         except:
             return None
 
@@ -278,19 +331,29 @@ class FlashscoreGoalsScraper:
         score_away = None
 
         try:
-            score_spans = self.page.locator(".detailScore__wrapper span").all()
+            score_spans = self.page.locator(
+                ".detailScore__wrapper span"
+            ).all()
+
             if len(score_spans) >= 3:
                 h = score_spans[0].inner_text().strip()
                 d = score_spans[1].inner_text().strip()
                 a = score_spans[2].inner_text().strip()
+
                 if d == "-" and h.isdigit() and a.isdigit():
                     score_home = int(h)
                     score_away = int(a)
+
         except:
             pass
 
-        home = self._safe_text(".duelParticipant__home .participant__participantName a") or "?"
-        away = self._safe_text(".duelParticipant__away .participant__participantName a") or "?"
+        home = self._safe_text(
+            ".duelParticipant__home .participant__participantName a"
+        ) or "?"
+
+        away = self._safe_text(
+            ".duelParticipant__away .participant__participantName a"
+        ) or "?"
 
         return {
             "home": home,
@@ -303,26 +366,37 @@ class FlashscoreGoalsScraper:
     def _team_match_score(self, a, b):
         a_n = self.normalize_name(a)
         b_n = self.normalize_name(b)
+
         if not a_n or not b_n:
             return 0.0
+
         if a_n == b_n:
             return 1.0
+
         if a_n in b_n or b_n in a_n:
             return 0.95
+
         return SequenceMatcher(None, a_n, b_n).ratio()
 
     def _team_matches(self, candidate, aliases, threshold=0.62):
         for alias in aliases:
             if not alias:
                 continue
+
             if self._team_match_score(candidate, alias) >= threshold:
                 return True
+
         return False
 
     def calculate_team_goals(self, results):
         total_goals = 0
         matches_counted = 0
-        aliases = [self.team_slug, self.team_label, self.slug_to_team_name(self.team_slug)]
+
+        aliases = [
+            self.team_slug,
+            self.team_label,
+            self.slug_to_team_name(self.team_slug)
+        ]
 
         for r in results:
             home_team = r.get("home", "")
@@ -331,11 +405,17 @@ class FlashscoreGoalsScraper:
             if self._team_matches(home_team, aliases):
                 total_goals += r.get("goals_home") or 0
                 matches_counted += 1
+
             elif self._team_matches(away_team, aliases):
                 total_goals += r.get("goals_away") or 0
                 matches_counted += 1
 
-        avg_goals = total_goals / matches_counted if matches_counted > 0 else 0
+        avg_goals = (
+            total_goals / matches_counted
+            if matches_counted > 0
+            else 0
+        )
+
         return {
             "team": self.team_label or self.team_slug,
             "total_goals": total_goals,
@@ -346,7 +426,12 @@ class FlashscoreGoalsScraper:
     def calculate_team_goals_conceded(self, results):
         total_conceded = 0
         counted = 0
-        aliases = [self.team_slug, self.team_label, self.slug_to_team_name(self.team_slug)]
+
+        aliases = [
+            self.team_slug,
+            self.team_label,
+            self.slug_to_team_name(self.team_slug)
+        ]
 
         for r in results:
             home_team = r.get("home", "")
@@ -355,17 +440,28 @@ class FlashscoreGoalsScraper:
             if self._team_matches(home_team, aliases):
                 total_conceded += r.get("goals_away") or 0
                 counted += 1
+
             elif self._team_matches(away_team, aliases):
                 total_conceded += r.get("goals_home") or 0
                 counted += 1
 
-        avg_conceded = total_conceded / counted if counted > 0 else 0
+        avg_conceded = (
+            total_conceded / counted
+            if counted > 0
+            else 0
+        )
+
         return round(avg_conceded, 2)
 
     def calculate_team_xg(self, results):
         total_xg = 0
         counted = 0
-        aliases = [self.team_slug, self.team_label, self.slug_to_team_name(self.team_slug)]
+
+        aliases = [
+            self.team_slug,
+            self.team_label,
+            self.slug_to_team_name(self.team_slug)
+        ]
 
         for r in results:
             home_team = r.get("home", "")
@@ -375,6 +471,7 @@ class FlashscoreGoalsScraper:
                 if r.get("home_xg") is not None:
                     total_xg += r["home_xg"]
                     counted += 1
+
             elif self._team_matches(away_team, aliases):
                 if r.get("away_xg") is not None:
                     total_xg += r["away_xg"]
@@ -382,12 +479,18 @@ class FlashscoreGoalsScraper:
 
         if counted == 0:
             return None
+
         return round(total_xg / counted, 2)
 
     def calculate_team_xga(self, results):
         total_xga = 0
         counted = 0
-        aliases = [self.team_slug, self.team_label, self.slug_to_team_name(self.team_slug)]
+
+        aliases = [
+            self.team_slug,
+            self.team_label,
+            self.slug_to_team_name(self.team_slug)
+        ]
 
         for r in results:
             home_team = r.get("home", "")
@@ -397,6 +500,7 @@ class FlashscoreGoalsScraper:
                 if r.get("away_xg") is not None:
                     total_xga += r["away_xg"]
                     counted += 1
+
             elif self._team_matches(away_team, aliases):
                 if r.get("home_xg") is not None:
                     total_xga += r["home_xg"]
@@ -404,6 +508,7 @@ class FlashscoreGoalsScraper:
 
         if counted == 0:
             return None
+
         return round(total_xga / counted, 2)
 
     def analyze_team(self, team_url):
@@ -415,10 +520,22 @@ class FlashscoreGoalsScraper:
 
         for url in matches:
             match_data = self.get_match_goals(url)
+
             if match_data:
                 xg_data = self.get_match_xg(url)
-                match_data["home_xg"] = xg_data.get("home_xg") if xg_data else None
-                match_data["away_xg"] = xg_data.get("away_xg") if xg_data else None
+
+                match_data["home_xg"] = (
+                    xg_data.get("home_xg")
+                    if xg_data
+                    else None
+                )
+
+                match_data["away_xg"] = (
+                    xg_data.get("away_xg")
+                    if xg_data
+                    else None
+                )
+
                 results.append(match_data)
 
         stats = self.calculate_team_goals(results)
@@ -426,10 +543,16 @@ class FlashscoreGoalsScraper:
         avg_xg = self.calculate_team_xg(results)
         avg_xga = self.calculate_team_xga(results)
 
-        avg_gd = round(stats["avg_goals"] - avg_gc, 2)
+        avg_gd = round(
+            stats["avg_goals"] - avg_gc,
+            2
+        )
 
         if avg_xg is not None and avg_xga is not None:
-            avg_xgd = round(avg_xg - avg_xga, 2)
+            avg_xgd = round(
+                avg_xg - avg_xga,
+                2
+            )
         else:
             avg_xgd = None
 
@@ -457,70 +580,116 @@ class FlashscoreGoalsScraper:
 
 
 # ---------------- SIGNAL ENGINE ----------------
-# Win-score weighting: dominance gap (8) + goal/conceded corroboration (4) + xGA (2) = 14 max.
+
+# Win-score weighting:
+# dominance gap (8) + goal/conceded corroboration (4) + xGA (2) = 14 max.
+
 MAX_WIN_SCORE = 14
 HIGH_WIN_THRESHOLD = 10
 
 
-def _win_score(fav_gd, dog_gd, fav_g, fav_gc, dog_g, dog_gc, fav_xga, dog_xga):
-    """Points toward fav beating dog. gd/xga args are None-safe; dog/fav args use the
-    same metric family (both GD or both xGD) so a partial xG match doesn't mix scales."""
+def _win_score(
+    fav_gd,
+    dog_gd,
+    fav_g,
+    fav_gc,
+    dog_g,
+    dog_gc,
+    fav_xga,
+    dog_xga
+):
+    """
+    Points toward fav beating dog.
+
+    gd/xga args are None-safe.
+    dog/fav args use the same metric family
+    (both GD or both xGD) so a partial xG match
+    doesn't mix scales.
+    """
+
     score = 0.0
 
+    # Favourite goal difference
     if fav_gd >= 1.5:
         score += 3
+
     elif fav_gd >= 1.0:
         score += 2
+
     elif fav_gd >= 0.5:
         score += 1
 
+    # Underdog goal difference
     if dog_gd <= -1.2:
         score += 3
+
     elif dog_gd <= -0.8:
         score += 2
+
     elif dog_gd <= -0.4:
         score += 1
 
+    # Goal difference gap
     gap = fav_gd - dog_gd
+
     if gap >= 2.5:
         score += 2
+
     elif gap >= 1.8:
         score += 1
 
+    # Favourite scoring
     if fav_g >= 2.0:
         score += 1
+
     elif fav_g >= 1.8:
         score += 0.5
 
+    # Favourite defence
     if fav_gc <= 0.9:
         score += 1
+
     elif fav_gc <= 1.1:
         score += 0.5
 
+    # Underdog scoring
     if dog_g <= 1.0:
         score += 1
+
     elif dog_g <= 1.2:
         score += 0.5
 
+    # Underdog defence
     if dog_gc >= 1.8:
         score += 1
+
     elif dog_gc >= 1.6:
         score += 0.5
 
+    # Favourite xGA
     if fav_xga is not None and fav_xga <= 1.0:
         score += 1
+
     elif fav_xga is not None and fav_xga <= 1.25:
         score += 0.5
 
+    # Underdog xGA
     if dog_xga is not None and dog_xga >= 1.8:
         score += 1
+
     elif dog_xga is not None and dog_xga >= 1.55:
         score += 0.5
 
     return score
 
 
-def evaluate_bet_signals(home, away, home_data, away_data, m_url):
+def evaluate_bet_signals(
+    home,
+    away,
+    home_data,
+    away_data,
+    m_url
+):
     hs = home_data["stats"]
     as_ = away_data["stats"]
 
@@ -553,55 +722,146 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
             warnings.append(text)
 
     use_xg = (
-        h_xg is not None and a_xg is not None and
-        h_xga is not None and a_xga is not None and
-        h_xgd is not None and a_xgd is not None
+        h_xg is not None
+        and a_xg is not None
+        and h_xga is not None
+        and a_xga is not None
+        and h_xgd is not None
+        and a_xgd is not None
     )
 
-    # --- Overperformance warnings ---
-    if h_g >= 2.0 and (h_xg is not None and h_xg <= 1.5):
-        add_warning(f"{home} may be overperforming its finishing (caution on backing them blindly)")
-    if a_g >= 2.0 and (a_xg is not None and a_xg <= 1.5):
-        add_warning(f"{away} may be overperforming its finishing (caution on backing them blindly)")
+    # -------------------------------------------------
+    # OVERPERFORMANCE WARNINGS
+    # -------------------------------------------------
 
-    # --- Defensive weakness warnings ---
+    if h_g >= 2.0 and (
+        h_xg is not None and h_xg <= 1.5
+    ):
+        add_warning(
+            f"{home} may be overperforming its finishing "
+            f"(caution on backing them blindly)"
+        )
+
+    if a_g >= 2.0 and (
+        a_xg is not None and a_xg <= 1.5
+    ):
+        add_warning(
+            f"{away} may be overperforming its finishing "
+            f"(caution on backing them blindly)"
+        )
+
+    # -------------------------------------------------
+    # DEFENSIVE WEAKNESS WARNINGS
+    # -------------------------------------------------
+
     if h_gc >= 1.8:
-        add_warning(f"{home} defensive weakness: opponent scoring chances look high")
+        add_warning(
+            f"{home} defensive weakness: "
+            f"opponent scoring chances look high"
+        )
+
     if a_gc >= 1.8:
-        add_warning(f"{away} defensive weakness: opponent scoring chances look high")
+        add_warning(
+            f"{away} defensive weakness: "
+            f"opponent scoring chances look high"
+        )
 
-    # ---------------- WIN SIGNALS (scored, tiered) ----------------
-    # Home only: away-win alerts have been removed.
-    fav_metric_h, dog_metric_h = (h_xgd, a_xgd) if use_xg else (h_gd, a_gd)
-    h_xga_arg, a_xga_arg = (h_xga, a_xga) if use_xg else (None, None)
+    # -------------------------------------------------
+    # HOME WIN SIGNAL
+    # -------------------------------------------------
+    #
+    # NEW HARD FILTERS:
+    #
+    # 1. Away team must average LESS than 1 goal/game.
+    #
+    # 2. Home team must concede NO MORE than 1 goal/game.
+    #
+    # These are mandatory. If either condition fails,
+    # the home-win signal cannot be generated.
+    # -------------------------------------------------
 
-    home_win_score = _win_score(
-        fav_metric_h, dog_metric_h, h_g, h_gc, a_g, a_gc, h_xga_arg, a_xga_arg
+    home_win_eligible = (
+        a_g < 1.0
+        and h_gc <= 1.0
     )
 
-    if home_win_score >= HIGH_WIN_THRESHOLD:
-        add_positive(1, f"HIGH-CONFIDENCE home win signal for {home} (score {home_win_score:.1f}/{MAX_WIN_SCORE})")
+    if home_win_eligible:
 
-    # --- Low goal / Under signals (tiered by how many conditions hold) ---
+        # Use xGD when complete xG data exists.
+        # Otherwise use normal goal difference.
+        fav_metric_h, dog_metric_h = (
+            (h_xgd, a_xgd)
+            if use_xg
+            else
+            (h_gd, a_gd)
+        )
+
+        h_xga_arg, a_xga_arg = (
+            (h_xga, a_xga)
+            if use_xg
+            else
+            (None, None)
+        )
+
+        home_win_score = _win_score(
+            fav_metric_h,
+            dog_metric_h,
+            h_g,
+            h_gc,
+            a_g,
+            a_gc,
+            h_xga_arg,
+            a_xga_arg
+        )
+
+        if home_win_score >= HIGH_WIN_THRESHOLD:
+            add_positive(
+                1,
+                f"HIGH-CONFIDENCE home win signal for "
+                f"{home} "
+                f"(score {home_win_score:.1f}/{MAX_WIN_SCORE})"
+            )
+
+    # -------------------------------------------------
+    # LOW GOAL / UNDER 2.5 SIGNAL
+    # -------------------------------------------------
+
     if use_xg:
+
         conditions_met = 0
+
+        # Both teams create few chances
         if h_xg <= 0.9 and a_xg <= 0.9:
             conditions_met += 1
+
+        # Both teams concede few chances
         if h_xga <= 1.1 and a_xga <= 1.1:
             conditions_met += 1
+
+        # Teams have similar xGD
         if abs(h_xgd - a_xgd) <= 0.4:
             conditions_met += 1
 
         if conditions_met == 3:
-            add_positive(3, "Strong low-goal signal: likely Under 2.5")
+            add_positive(
+                3,
+                "Strong low-goal signal: likely Under 2.5"
+            )
 
-    # ---------------- FINAL OUTPUT ----------------
+    # -------------------------------------------------
+    # FINAL OUTPUT
+    # -------------------------------------------------
+
     if not positive:
         return None
 
     positive.sort(key=lambda x: x[0])
+
     best_signal = positive[0][1]
-    all_signals = [text for _, text in positive]
+
+    all_signals = [
+        text for _, text in positive
+    ]
 
     def fmt(v):
         return "N/A" if v is None else str(v)
@@ -610,116 +870,276 @@ def evaluate_bet_signals(home, away, home_data, away_data, m_url):
         f"⚽ {home} vs {away}\n\n"
         f"Best signal: {best_signal}\n\n"
         f"📊 Team stats\n"
-        f"{home}  Goals: {h_g} | Conceded: {h_gc} | GD: {h_gd} | xG: {fmt(h_xg)} | xGA: {fmt(h_xga)} | xGD: {fmt(h_xgd)}\n"
-        f"{away}  Goals: {a_g} | Conceded: {a_gc} | GD: {a_gd} | xG: {fmt(a_xg)} | xGA: {fmt(a_xga)} | xGD: {fmt(a_xgd)}\n\n"
+        f"{home}  "
+        f"Goals: {h_g} | "
+        f"Conceded: {h_gc} | "
+        f"GD: {h_gd} | "
+        f"xG: {fmt(h_xg)} | "
+        f"xGA: {fmt(h_xga)} | "
+        f"xGD: {fmt(h_xgd)}\n"
+
+        f"{away}  "
+        f"Goals: {a_g} | "
+        f"Conceded: {a_gc} | "
+        f"GD: {a_gd} | "
+        f"xG: {fmt(a_xg)} | "
+        f"xGA: {fmt(a_xga)} | "
+        f"xGD: {fmt(a_xgd)}\n\n"
+
         f"Signals:\n"
-        + "\n".join(f"- {s}" for s in all_signals)
+        + "\n".join(
+            f"- {s}"
+            for s in all_signals
+        )
     )
 
     if warnings:
-        message += "\n\nCautions:\n" + "\n".join(f"- {w}" for w in warnings)
+        message += (
+            "\n\nCautions:\n"
+            + "\n".join(
+                f"- {w}"
+                for w in warnings
+            )
+        )
 
-    message += f"\n\nMatch URL: {m_url}"
+    message += (
+        f"\n\nMatch URL: {m_url}"
+    )
+
     return message
 
 
 # ---------------- ALERT SCRIPT ----------------
+
 def main():
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--start", type=int, default=0)
-    parser.add_argument("--limit", type=int, default=100)
+
+    parser.add_argument(
+        "--start",
+        type=int,
+        default=0
+    )
+
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=100
+    )
+
     args = parser.parse_args()
 
     START = max(0, args.start)
     LIMIT = max(1, args.limit)
+
     TARGET_COUNT = START + LIMIT
 
-    BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-    CHAT_ID = os.getenv("CHAT_ID", "").strip()
-    FIXTURES_URL = "https://www.flashscore.co.za/"
+    BOT_TOKEN = os.getenv(
+        "BOT_TOKEN",
+        ""
+    ).strip()
+
+    CHAT_ID = os.getenv(
+        "CHAT_ID",
+        ""
+    ).strip()
+
+    FIXTURES_URL = (
+        "https://www.flashscore.co.za/"
+    )
+
     HEADLESS = True
 
     if not BOT_TOKEN or not CHAT_ID:
-        print("[ERROR] BOT_TOKEN or CHAT_ID is missing from environment variables.")
+
+        print(
+            "[ERROR] BOT_TOKEN or CHAT_ID "
+            "is missing from environment variables."
+        )
+
         return
 
     send_job_status(
-        f"🚀 Job STARTED\nBatch START={START} LIMIT={LIMIT}",
+        f"🚀 Job STARTED\n"
+        f"Batch START={START} LIMIT={LIMIT}",
         BOT_TOKEN,
         CHAT_ID
     )
 
-    print("[INFO] Starting Flashscore alert script...")
-    print(f"[INFO] Batch start={START}, limit={LIMIT}")
+    print(
+        "[INFO] Starting Flashscore alert script..."
+    )
 
-    scraper = FlashscoreGoalsScraper(headless=HEADLESS)
+    print(
+        f"[INFO] Batch start={START}, "
+        f"limit={LIMIT}"
+    )
+
+    scraper = FlashscoreGoalsScraper(
+        headless=HEADLESS
+    )
 
     try:
-        print(f"[INFO] Opening fixtures page: {FIXTURES_URL}")
-        scraper.page.goto(FIXTURES_URL, wait_until="load", timeout=80000)
+
+        print(
+            f"[INFO] Opening fixtures page: "
+            f"{FIXTURES_URL}"
+        )
+
+        scraper.page.goto(
+            FIXTURES_URL,
+            wait_until="load",
+            timeout=80000
+        )
+
         time.sleep(3)
 
-        matches = scraper.discover_matches(TARGET_COUNT)
-        print(f"[INFO] Found {len(matches)} upcoming matches total")
+        matches = scraper.discover_matches(
+            TARGET_COUNT
+        )
 
-        batch_matches = matches[START:START + LIMIT]
-        print(f"[INFO] This job will process {len(batch_matches)} matches from {START} to {START + LIMIT - 1}")
+        print(
+            f"[INFO] Found {len(matches)} "
+            f"upcoming matches total"
+        )
+
+        batch_matches = matches[
+            START:START + LIMIT
+        ]
+
+        print(
+            f"[INFO] This job will process "
+            f"{len(batch_matches)} matches "
+            f"from {START} to "
+            f"{START + LIMIT - 1}"
+        )
 
         if not batch_matches:
-            print("[INFO] No matches in this batch. Exiting.")
+
+            print(
+                "[INFO] No matches in this batch. "
+                "Exiting."
+            )
+
             send_job_status(
-                f"⚠️ Job FINISHED (No matches)\nBatch START={START} LIMIT={LIMIT}",
+                f"⚠️ Job FINISHED (No matches)\n"
+                f"Batch START={START} LIMIT={LIMIT}",
                 BOT_TOKEN,
                 CHAT_ID
             )
+
             return
 
-        for idx, m_url in enumerate(batch_matches, start=START + 1):
-            print(f"[INFO] Processing match {idx}: {m_url}")
-            fixture = scraper.get_match_teams_and_links(m_url)
+        for idx, m_url in enumerate(
+            batch_matches,
+            start=START + 1
+        ):
 
-            if not fixture or not fixture["home_name"] or not fixture["away_name"]:
-                print("[WARN] Could not extract teams, skipping match")
+            print(
+                f"[INFO] Processing match "
+                f"{idx}: {m_url}"
+            )
+
+            fixture = (
+                scraper.get_match_teams_and_links(
+                    m_url
+                )
+            )
+
+            if (
+                not fixture
+                or not fixture["home_name"]
+                or not fixture["away_name"]
+            ):
+
+                print(
+                    "[WARN] Could not extract teams, "
+                    "skipping match"
+                )
+
                 continue
 
             home = fixture["home_name"]
             away = fixture["away_name"]
 
-            home_data = scraper.analyze_team(fixture["home_url"])
-            away_data = scraper.analyze_team(fixture["away_url"])
+            home_data = scraper.analyze_team(
+                fixture["home_url"]
+            )
+
+            away_data = scraper.analyze_team(
+                fixture["away_url"]
+            )
 
             if not home_data or not away_data:
-                print("[WARN] Could not analyze one or both teams, skipping match")
+
+                print(
+                    "[WARN] Could not analyze "
+                    "one or both teams, "
+                    "skipping match"
+                )
+
                 continue
 
-            msg = evaluate_bet_signals(home, away, home_data, away_data, m_url)
+            msg = evaluate_bet_signals(
+                home,
+                away,
+                home_data,
+                away_data,
+                m_url
+            )
 
             if msg:
+
                 print("[ALERT]")
                 print(msg)
-                scraper.send_telegram_message(msg, BOT_TOKEN, CHAT_ID)
+
+                scraper.send_telegram_message(
+                    msg,
+                    BOT_TOKEN,
+                    CHAT_ID
+                )
+
             else:
-                print("[INFO] No signals found.")
+
+                print(
+                    "[INFO] No signals found."
+                )
 
         send_job_status(
-            f"✅ Job FINISHED\nBatch START={START} LIMIT={LIMIT}",
+            f"✅ Job FINISHED\n"
+            f"Batch START={START} LIMIT={LIMIT}",
             BOT_TOKEN,
             CHAT_ID
         )
 
     except Exception as e:
-        print("[ERROR]", e)
+
+        print(
+            "[ERROR]",
+            e
+        )
+
         send_job_status(
-            f"❌ Job FAILED\nBatch START={START} LIMIT={LIMIT}\nError: {str(e)}",
+            f"❌ Job FAILED\n"
+            f"Batch START={START} LIMIT={LIMIT}\n"
+            f"Error: {str(e)}",
             BOT_TOKEN,
             CHAT_ID
         )
 
     finally:
-        print("[INFO] Closing browser...")
+
+        print(
+            "[INFO] Closing browser..."
+        )
+
         scraper.close()
-        print("[INFO] Script finished.")
+
+        print(
+            "[INFO] Script finished."
+        )
 
 
 if __name__ == "__main__":
     main()
+```
