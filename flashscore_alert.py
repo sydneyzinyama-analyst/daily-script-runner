@@ -1,6 +1,8 @@
-```python
 import os
+import sys
 import argparse
+import logging
+import traceback
 from playwright.sync_api import sync_playwright
 from urllib.parse import urlparse
 from difflib import SequenceMatcher
@@ -10,21 +12,51 @@ import unicodedata
 import requests
 
 
+# ---------------- LOGGING ----------------
+# Scheduler stdout is frequently not captured/visible, so we always
+# write to a log file as well as stdout. Override the path with
+# SCRAPER_LOG_PATH if you want logs somewhere specific.
+LOG_PATH = os.getenv("SCRAPER_LOG_PATH", "flashscore_scraper.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_PATH),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("flashscore")
+
+
 # ---------------- JOB STATUS TELEGRAM ----------------
 def send_job_status(message, bot_token, chat_id):
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {"chat_id": chat_id, "text": message}
         requests.post(url, data=payload, timeout=20)
-    except:
-        pass
+    except Exception as e:
+        log.warning(f"Failed to send job status to Telegram: {e}")
 
 
 # ---------------- SCRAPER CLASS ----------------
 class FlashscoreGoalsScraper:
     def __init__(self, headless=True):
         self.playwright = sync_playwright().start()
-        self.browser = self.playwright.chromium.launch(headless=headless)
+        self.browser = self.playwright.chromium.launch(
+            headless=headless,
+            # --no-sandbox / --disable-dev-shm-usage are required in most
+            # scheduler contexts: cron/systemd jobs often run as root (where
+            # Chromium's sandbox refuses to start without --no-sandbox) or
+            # in containers with a tiny /dev/shm. Without these flags the
+            # browser can fail to launch even though it works fine when you
+            # run the script by hand as a regular user.
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
         self.context = self.browser.new_context(
             viewport={"width": 1280, "height": 900},
             user_agent=(
@@ -44,9 +76,9 @@ class FlashscoreGoalsScraper:
             payload = {"chat_id": chat_id, "text": message}
             r = requests.post(url, data=payload, timeout=20)
             if r.status_code != 200:
-                print("[WARN] Telegram error:", r.text)
+                log.warning(f"Telegram error: {r.text}")
         except Exception as e:
-            print("[ERROR] Failed to send Telegram message:", e)
+            log.error(f"Failed to send Telegram message: {e}")
 
     # ---------------- HELPERS ----------------
     def normalize_name(self, text):
@@ -66,7 +98,7 @@ class FlashscoreGoalsScraper:
             path_parts = urlparse(team_url).path.strip("/").split("/")
             if len(path_parts) >= 2 and path_parts[0] == "team":
                 return path_parts[1]
-        except:
+        except Exception:
             pass
         return ""
 
@@ -83,7 +115,7 @@ class FlashscoreGoalsScraper:
             if loc.count() > 0:
                 text = loc.first.inner_text().strip()
                 return text
-        except:
+        except Exception:
             pass
         return ""
 
@@ -94,9 +126,30 @@ class FlashscoreGoalsScraper:
                 val = loc.first.get_attribute(attr_name)
                 if val:
                     return val
-        except:
+        except Exception:
             pass
         return ""
+
+    def accept_cookies(self):
+        # Flashscore (and most EU-facing sites) show a cookie consent
+        # overlay on first visit. A scheduler always starts a fresh
+        # browser context (no saved consent cookie), so this overlay can
+        # intercept clicks and silently break discovery/expansion that
+        # worked fine in your already-consented local browser session.
+        selectors = [
+            "#onetrust-accept-btn-handler",
+            "button:has-text('Accept')",
+            "button:has-text('I Accept')",
+        ]
+        for selector in selectors:
+            try:
+                btn = self.page.locator(selector)
+                if btn.count() > 0 and btn.first.is_visible():
+                    btn.first.click(timeout=3000)
+                    time.sleep(1)
+                    return
+            except Exception:
+                continue
 
     def get_team_name_from_page(self):
         selectors = [
@@ -114,7 +167,7 @@ class FlashscoreGoalsScraper:
                         text = re.sub(r"^Soccer:\s*", "", text, flags=re.IGNORECASE)
                         text = re.sub(r"\s+results?\s*$", "", text, flags=re.IGNORECASE)
                         return text
-            except:
+            except Exception:
                 pass
         return ""
 
@@ -124,16 +177,17 @@ class FlashscoreGoalsScraper:
         self.team_slug = self.extract_team_slug_from_url(team_url)
         self.team_label = self.slug_to_team_name(self.team_slug)
         url = team_url.rstrip("/") + "/results/"
-        print(f"[INFO] Opening results page: {url}")
+        log.info(f"Opening results page: {url}")
         try:
             self.page.goto(url, wait_until="load", timeout=90000)
             time.sleep(3)
+            self.accept_cookies()
             page_name = self.get_team_name_from_page()
             if page_name:
                 self.team_label = page_name
             return True
         except Exception as e:
-            print(f"[ERROR] Failed to load results: {e}")
+            log.error(f"Failed to load results: {e}")
             return False
 
     def expand_hidden_matches(self):
@@ -155,7 +209,7 @@ class FlashscoreGoalsScraper:
                             clicked += 1
                             time.sleep(0.3)
                     except Exception as e:
-                        print(f"[WARN] Skipping button {i}:", e)
+                        log.warning(f"Skipping button {i}: {e}")
 
                 if clicked == 0:
                     break
@@ -163,7 +217,7 @@ class FlashscoreGoalsScraper:
                 time.sleep(1)
 
         except Exception as e:
-            print("[WARN] expand_hidden_matches failed:", e)
+            log.warning(f"expand_hidden_matches failed: {e}")
 
     def discover_matches(self, target_count, max_tries=250):
         matches = []
@@ -194,7 +248,7 @@ class FlashscoreGoalsScraper:
 
             try:
                 self.page.mouse.wheel(0, 6000)
-            except:
+            except Exception:
                 pass
 
             time.sleep(2)
@@ -206,7 +260,7 @@ class FlashscoreGoalsScraper:
         try:
             self.page.goto(match_url, wait_until="networkidle", timeout=90000)
             time.sleep(3)
-        except:
+        except Exception:
             return None
 
         home_name = self._safe_text(
@@ -241,7 +295,7 @@ class FlashscoreGoalsScraper:
 
             return f"{base}summary/stats/overall/?mid={mid}"
 
-        except:
+        except Exception:
             return None
 
     def get_match_xg(self, match_url):
@@ -262,7 +316,7 @@ class FlashscoreGoalsScraper:
             )
             time.sleep(3)
 
-        except:
+        except Exception:
             return {
                 "home_xg": None,
                 "away_xg": None,
@@ -299,7 +353,7 @@ class FlashscoreGoalsScraper:
                                 "match_url": match_url
                             }
 
-                except:
+                except Exception:
                     continue
 
             return {
@@ -308,7 +362,7 @@ class FlashscoreGoalsScraper:
                 "match_url": match_url
             }
 
-        except:
+        except Exception:
             return {
                 "home_xg": None,
                 "away_xg": None,
@@ -324,7 +378,7 @@ class FlashscoreGoalsScraper:
             )
             time.sleep(3)
 
-        except:
+        except Exception:
             return None
 
         score_home = None
@@ -344,7 +398,7 @@ class FlashscoreGoalsScraper:
                     score_home = int(h)
                     score_away = int(a)
 
-        except:
+        except Exception:
             pass
 
         home = self._safe_text(
@@ -575,8 +629,8 @@ class FlashscoreGoalsScraper:
         try:
             self.browser.close()
             self.playwright.stop()
-        except:
-            pass
+        except Exception as e:
+            log.warning(f"Error while closing browser: {e}")
 
 
 # ---------------- SIGNAL ENGINE ----------------
@@ -951,12 +1005,15 @@ def main():
     HEADLESS = True
 
     if not BOT_TOKEN or not CHAT_ID:
-
-        print(
-            "[ERROR] BOT_TOKEN or CHAT_ID "
-            "is missing from environment variables."
+        # NOTE: cron/systemd/most schedulers do NOT source your shell
+        # profile (.bashrc/.profile/.env), so env vars that are visible
+        # in an interactive shell can be empty here even though "they're
+        # set". Make sure BOT_TOKEN/CHAT_ID are exported explicitly in
+        # whatever mechanism launches this script (crontab line,
+        # systemd unit's Environment=, scheduler's env config, etc.).
+        log.error(
+            "BOT_TOKEN or CHAT_ID is missing from environment variables."
         )
-
         return
 
     send_job_status(
@@ -966,25 +1023,23 @@ def main():
         CHAT_ID
     )
 
-    print(
-        "[INFO] Starting Flashscore alert script..."
-    )
+    log.info("Starting Flashscore alert script...")
+    log.info(f"Batch start={START}, limit={LIMIT}")
 
-    print(
-        f"[INFO] Batch start={START}, "
-        f"limit={LIMIT}"
-    )
-
-    scraper = FlashscoreGoalsScraper(
-        headless=HEADLESS
-    )
+    # Declared before the try block so `finally` can safely check it even
+    # if construction itself fails (see below).
+    scraper = None
 
     try:
+        # Building the scraper (Playwright start + browser launch) is now
+        # INSIDE the try block. Previously this happened before the try,
+        # so any launch failure (missing browser binaries, missing OS
+        # deps, sandbox restrictions when run as root under cron, etc.)
+        # crashed the whole process with no "❌ Job FAILED" alert and no
+        # cleanup — you'd only ever see the "🚀 Job STARTED" message.
+        scraper = FlashscoreGoalsScraper(headless=HEADLESS)
 
-        print(
-            f"[INFO] Opening fixtures page: "
-            f"{FIXTURES_URL}"
-        )
+        log.info(f"Opening fixtures page: {FIXTURES_URL}")
 
         scraper.page.goto(
             FIXTURES_URL,
@@ -993,33 +1048,26 @@ def main():
         )
 
         time.sleep(3)
+        scraper.accept_cookies()
 
         matches = scraper.discover_matches(
             TARGET_COUNT
         )
 
-        print(
-            f"[INFO] Found {len(matches)} "
-            f"upcoming matches total"
-        )
+        log.info(f"Found {len(matches)} upcoming matches total")
 
         batch_matches = matches[
             START:START + LIMIT
         ]
 
-        print(
-            f"[INFO] This job will process "
-            f"{len(batch_matches)} matches "
-            f"from {START} to "
-            f"{START + LIMIT - 1}"
+        log.info(
+            f"This job will process {len(batch_matches)} matches "
+            f"from {START} to {START + LIMIT - 1}"
         )
 
         if not batch_matches:
 
-            print(
-                "[INFO] No matches in this batch. "
-                "Exiting."
-            )
+            log.info("No matches in this batch. Exiting.")
 
             send_job_status(
                 f"⚠️ Job FINISHED (No matches)\n"
@@ -1035,75 +1083,78 @@ def main():
             start=START + 1
         ):
 
-            print(
-                f"[INFO] Processing match "
-                f"{idx}: {m_url}"
-            )
+            log.info(f"Processing match {idx}: {m_url}")
 
-            fixture = (
-                scraper.get_match_teams_and_links(
+            try:
+                fixture = (
+                    scraper.get_match_teams_and_links(
+                        m_url
+                    )
+                )
+
+                if (
+                    not fixture
+                    or not fixture["home_name"]
+                    or not fixture["away_name"]
+                ):
+
+                    log.warning(
+                        "Could not extract teams, skipping match"
+                    )
+
+                    continue
+
+                home = fixture["home_name"]
+                away = fixture["away_name"]
+
+                home_data = scraper.analyze_team(
+                    fixture["home_url"]
+                )
+
+                away_data = scraper.analyze_team(
+                    fixture["away_url"]
+                )
+
+                if not home_data or not away_data:
+
+                    log.warning(
+                        "Could not analyze one or both teams, "
+                        "skipping match"
+                    )
+
+                    continue
+
+                msg = evaluate_bet_signals(
+                    home,
+                    away,
+                    home_data,
+                    away_data,
                     m_url
                 )
-            )
 
-            if (
-                not fixture
-                or not fixture["home_name"]
-                or not fixture["away_name"]
-            ):
+                if msg:
 
-                print(
-                    "[WARN] Could not extract teams, "
-                    "skipping match"
+                    log.info("ALERT:\n" + msg)
+
+                    scraper.send_telegram_message(
+                        msg,
+                        BOT_TOKEN,
+                        CHAT_ID
+                    )
+
+                else:
+
+                    log.info("No signals found.")
+
+            except Exception as match_err:
+                # A single bad match (odd page layout, timeout, etc.)
+                # should not take down the whole batch — log it and
+                # move on to the next match instead.
+                log.error(
+                    f"Error processing match {m_url}: {match_err}"
                 )
-
+                log.debug(traceback.format_exc())
                 continue
-
-            home = fixture["home_name"]
-            away = fixture["away_name"]
-
-            home_data = scraper.analyze_team(
-                fixture["home_url"]
-            )
-
-            away_data = scraper.analyze_team(
-                fixture["away_url"]
-            )
-
-            if not home_data or not away_data:
-
-                print(
-                    "[WARN] Could not analyze "
-                    "one or both teams, "
-                    "skipping match"
-                )
-
-                continue
-
-            msg = evaluate_bet_signals(
-                home,
-                away,
-                home_data,
-                away_data,
-                m_url
-            )
-
-            if msg:
-
-                print("[ALERT]")
-                print(msg)
-
-                scraper.send_telegram_message(
-                    msg,
-                    BOT_TOKEN,
-                    CHAT_ID
-                )
-
-            else:
-
-                print(
-                    "[INFO] No signals found."
-                )
 
         send_job_status(
             f"✅ Job FINISHED\n"
@@ -1114,10 +1165,8 @@ def main():
 
     except Exception as e:
 
-        print(
-            "[ERROR]",
-            e
-        )
+        log.error(f"Job failed: {e}")
+        log.error(traceback.format_exc())
 
         send_job_status(
             f"❌ Job FAILED\n"
@@ -1129,17 +1178,13 @@ def main():
 
     finally:
 
-        print(
-            "[INFO] Closing browser..."
-        )
+        log.info("Closing browser...")
 
-        scraper.close()
+        if scraper is not None:
+            scraper.close()
 
-        print(
-            "[INFO] Script finished."
-        )
+        log.info("Script finished.")
 
 
 if __name__ == "__main__":
     main()
-```
