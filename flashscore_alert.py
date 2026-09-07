@@ -74,9 +74,9 @@ class FlashscoreGoalsScraper:
         try:
             url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
             # Alert messages use Telegram's legacy Markdown for bold
-            # section headers (see evaluate_bet_signals) — team names
-            # are pre-escaped there so this doesn't choke on stray
-            # _ / * / ` / [ characters.
+            # section headers (see evaluate_home_margin_signal) — team
+            # names are pre-escaped there so this doesn't choke on
+            # stray _ / * / ` / [ characters.
             payload = {
                 "chat_id": chat_id,
                 "text": message,
@@ -143,7 +143,7 @@ class FlashscoreGoalsScraper:
         #   "19"                -> plain count
         #   "1.59"               -> decimal (xG, xGOT, goals prevented)
         #   "-0.43"              -> negative decimal (goals prevented)
-        #   "76%\n(262/343)"     -> percentage stats (passes, tackles...)
+        #   "76%\n(262/343)"     -> percentage stats (passes, possession...)
         # We only need the leading number in every case.
         if not text:
             return None
@@ -617,9 +617,10 @@ class FlashscoreGoalsScraper:
     def _team_stat_avg(self, results, stat_name, side="for"):
         """
         Generic averager for the extra stats (corners, big_chances,
-        yellow_cards, fouls, goals_prevented, xgot). Each match_data
-        dict is expected to carry home_<stat_name>/away_<stat_name>
-        keys, as produced by get_match_stats().
+        yellow_cards, fouls, goals_prevented, xgot, shots,
+        shots_on_target, possession). Each match_data dict is expected
+        to carry home_<stat_name>/away_<stat_name> keys, as produced
+        by get_match_stats().
 
         side="for"     -> the analyzed team's own stat
         side="against" -> the opponent's stat in that match (e.g. big
@@ -750,193 +751,105 @@ class FlashscoreGoalsScraper:
 
 
 # ---------------- SIGNAL ENGINE ----------------
+#
+# Single, focused prediction: HOME team wins by a 2+ goal margin
+# (2-0, 3-0, 3-1, 4-1, 4-2, ...). This is not a general betting-markets
+# engine — every other market from earlier iterations (draw, away win,
+# double chance, handicap, totals, corners/cards O/U, BTTS, clean
+# sheet, shots O/U, combos) has been removed. All the stats scraped by
+# FlashscoreGoalsScraper are still gathered the same way; this just
+# uses them narrowly, for one question.
+#
+# NOTE ON CONFIDENCE: every threshold below is a heuristic cutoff, not
+# a measured probability — nothing here has been validated against
+# actual historical outcomes. "HIGH-CONFIDENCE" means "clears a
+# deliberately severe set of hand-tuned filters", not "X% likely to
+# happen".
 
-# Win-score weighting:
-# dominance gap (8) + goal/conceded corroboration (4) + xGA (2) = 14 max.
-
-# NOTE ON CONFIDENCE: every threshold in this engine is a heuristic
-# cutoff, not a measured probability — nothing here has been validated
-# against actual historical outcomes. "HIGH-CONFIDENCE" means "clears
-# a deliberately severe set of hand-tuned filters", not "X% likely to
-# happen". Treat it as the most conservative reading these heuristics
-# can produce, not a calibrated number, until a real backtest exists.
-
-MAX_WIN_SCORE = 14
-HIGH_WIN_THRESHOLD = 13
-
-# Fallback path for matches/leagues where xG isn't published on
-# Flashscore at all (common outside the top few divisions). _win_score
-# is None-safe: with xga=None the two xGA bonus categories (2 points)
-# are simply unreachable, so the real ceiling without xG is 12, not 14.
-# The threshold is raised proportionally (11/12 ≈ 92%, in line with
-# 13/14 ≈ 93% for the xG path) and the underlying goal-difference
-# filters are tightened further, since GD alone is noisier than xGD
-# over a 5-6 match sample and there's no shot-quality data to
-# corroborate it.
-GD_ONLY_MAX_SCORE = 12
-GD_ONLY_HIGH_THRESHOLD = 11
-
-# Every signal in this engine requires each team's stats to be built
-# from at least this many of the up-to-6 fetched recent matches. Below
-# this, the sample is too thin to trust any signal on it — pushed to
-# require essentially the full window, not just "most of it".
+# Every signal requires each team's stats to be built from at least
+# this many of the up-to-6 fetched recent matches. Below this, the
+# sample is too thin to trust any prediction on it.
 MIN_SAMPLE_MATCHES = 6
 
+# The literal target: home win margin (goals for - goals against).
+MARGIN_TARGET = 2.0
 
-def _win_score(
-    fav_gd,
-    dog_gd,
-    fav_g,
-    fav_gc,
-    dog_g,
-    dog_gc,
-    fav_xga,
-    dog_xga
+# How far past MARGIN_TARGET the *expected* margin needs to sit before
+# this fires. Match-to-match variance means an expected margin of
+# exactly 2.0 is a coinflip on actually clearing it, not a safe call —
+# xG is a materially better estimator than raw averaged goals, so it
+# gets a smaller required buffer; the goals-only fallback needs more
+# daylight to trust it the same amount.
+XG_MARGIN_BUFFER = 0.9    # need expected_margin >= 2.9
+GD_MARGIN_BUFFER = 1.3    # need expected_margin >= 3.3
+
+# Corroboration score (see _margin_score) required on top of the
+# expected-margin gate above. This exists so the signal isn't just
+# trusting a goals/xG gap that might be riding a couple of clinical
+# finishes — it has to show up in shots, chances, or territory too.
+# Max achievable is ~6 (2 shots-on-target + 2 big chances for + 1 big
+# chances against + 1 corners), minus a possible -1.5 xGOT penalty.
+MARGIN_SCORE_THRESHOLD = 3.0
+
+
+def _margin_score(
+    h_sot_for, a_sot_against,
+    h_bc_for, a_bc_against,
+    a_bc_for, h_bc_against,
+    h_corners_for, a_corners_against,
+    a_xgot_for, a_g,
 ):
     """
-    Points toward fav beating dog.
+    Corroboration score for "home wins by 2+" on top of the expected-
+    margin gate. Uses the same for+against blended-expectation
+    approach as the corners/shots-on-target signals elsewhere in this
+    script (each side's own rate averaged with what their opponent
+    typically allows) — NOT a raw subtraction between the two, which
+    doesn't work here: h_sot_for and a_sot_against measure different
+    things on the same rough scale, so a genuinely strong case (e.g.
+    8.0 vs 7.5) can produce a near-zero "gap" despite both numbers
+    being high for a reason.
 
-    gd/xga args are None-safe.
-    dog/fav args use the same metric family
-    (both GD or both xGD) so a partial xG match
-    doesn't mix scales.
+    All args are None-safe (missing stats just contribute nothing
+    rather than disqualifying the match). Ends with a penalty, not a
+    bonus: if the away side has been scoring above its own shot
+    quality (xGOT), it's due a regression that would work against a
+    wide home margin.
     """
-
     score = 0.0
 
-    # Favourite goal difference
-    if fav_gd >= 1.5:
-        score += 3
+    if h_sot_for is not None and a_sot_against is not None:
+        expected_home_sot = (h_sot_for + a_sot_against) / 2
+        if expected_home_sot >= 6.0:
+            score += 2
+        elif expected_home_sot >= 4.5:
+            score += 1
 
-    elif fav_gd >= 1.0:
-        score += 2
+    if h_bc_for is not None and a_bc_against is not None:
+        expected_home_bc = (h_bc_for + a_bc_against) / 2
+        if expected_home_bc >= 3.0:
+            score += 2
+        elif expected_home_bc >= 2.0:
+            score += 1
 
-    elif fav_gd >= 0.5:
-        score += 1
+    # Away creating little in return corroborates the margin holding,
+    # not just the home side racking up chances.
+    if a_bc_for is not None and h_bc_against is not None:
+        expected_away_bc = (a_bc_for + h_bc_against) / 2
+        if expected_away_bc <= 1.0:
+            score += 1
 
-    # Underdog goal difference
-    if dog_gd <= -1.2:
-        score += 3
+    if h_corners_for is not None and a_corners_against is not None:
+        expected_home_corners = (h_corners_for + a_corners_against) / 2
+        if expected_home_corners >= 6.5:
+            score += 1
+        elif expected_home_corners >= 5.0:
+            score += 0.5
 
-    elif dog_gd <= -0.8:
-        score += 2
-
-    elif dog_gd <= -0.4:
-        score += 1
-
-    # Goal difference gap
-    gap = fav_gd - dog_gd
-
-    if gap >= 2.5:
-        score += 2
-
-    elif gap >= 1.8:
-        score += 1
-
-    # Favourite scoring
-    if fav_g >= 2.0:
-        score += 1
-
-    elif fav_g >= 1.8:
-        score += 0.5
-
-    # Favourite defence
-    if fav_gc <= 0.9:
-        score += 1
-
-    elif fav_gc <= 1.1:
-        score += 0.5
-
-    # Underdog scoring
-    if dog_g <= 1.0:
-        score += 1
-
-    elif dog_g <= 1.2:
-        score += 0.5
-
-    # Underdog defence
-    if dog_gc >= 1.8:
-        score += 1
-
-    elif dog_gc >= 1.6:
-        score += 0.5
-
-    # Favourite xGA
-    if fav_xga is not None and fav_xga <= 1.0:
-        score += 1
-
-    elif fav_xga is not None and fav_xga <= 1.25:
-        score += 0.5
-
-    # Underdog xGA
-    if dog_xga is not None and dog_xga >= 1.8:
-        score += 1
-
-    elif dog_xga is not None and dog_xga >= 1.55:
-        score += 0.5
+    if a_xgot_for is not None and a_g >= a_xgot_for + 0.8:
+        score -= 1.5
 
     return score
-
-
-# Total-goals lines a book actually offers. A line only "hits" when the
-# expected-goals figure clears it by a comfortable margin — this keeps
-# the ladder from firing on every match at the nearest line.
-TOTAL_GOAL_LINES = [0.5, 1.5, 2.5, 3.5, 4.5]
-TOTAL_GOAL_MARGIN = 1.5
-
-# Wider margin used when falling back to plain averaged goals instead
-# of xG — raw goals-per-game swings more from match to match, so it
-# needs more daylight from a line before we trust it.
-TOTAL_GOAL_MARGIN_GD = 2.0
-
-
-def _total_goals_lean(
-    expected_goals, label, priority=3, margin=TOTAL_GOAL_MARGIN,
-    category="goals"
-):
-    """
-    Picks the single most-confident Over/Under total-goals line for a
-    given expected-goals figure (combined match total, or one team's
-    own total). Returns a (priority, text, category) tuple, or None if
-    nothing clears `margin` on any offered line.
-
-    For Over, we want the *highest* line still comfortably cleared
-    (Over 3.5 is a stronger claim than Over 0.5 when both are true).
-    For Under, we want the *lowest* line still comfortably cleared,
-    for the same reason in the other direction.
-    """
-    if expected_goals is None:
-        return None
-
-    over_line = None
-    under_line = None
-
-    for line in TOTAL_GOAL_LINES:
-        gap = expected_goals - line
-
-        if gap >= margin:
-            over_line = line
-
-        if gap <= -margin and under_line is None:
-            under_line = line
-
-    if over_line is not None:
-        return (
-            priority,
-            f"{label}: likely Over {over_line} "
-            f"(expected ~{expected_goals:.2f})",
-            category
-        )
-
-    if under_line is not None:
-        return (
-            priority,
-            f"{label}: likely Under {under_line} "
-            f"(expected ~{expected_goals:.2f})",
-            category
-        )
-
-    return None
 
 
 def _escape_markdown(text):
@@ -951,43 +864,20 @@ def _escape_markdown(text):
     return re.sub(r"([_*`\[])", r"\\\1", str(text))
 
 
-# Market categories the alert message is grouped into, in display
-# order. Only categories that actually produced a signal get a
-# section header in the final message.
-CATEGORY_ORDER = [
-    "result", "goals", "clean_sheet", "corners_cards", "shots", "combo"
-]
-
-CATEGORY_LABELS = {
-    "result": "🏆 *Match Result*",
-    "goals": "⚽ *Goals*",
-    "clean_sheet": "🧤 *Clean Sheet*",
-    "corners_cards": "🚩 *Corners & Cards*",
-    "shots": "🎯 *Shots on Target*",
-    "combo": "🔀 *Combo Markets*",
-}
-
-
-def evaluate_bet_signals(
-    home,
-    away,
-    home_data,
-    away_data,
-    m_url
-):
-    # Escape once up front — every message string built below uses
-    # these names directly, so this covers headers, bullets and
-    # warnings without touching each call site individually.
+def evaluate_home_margin_signal(home, away, home_data, away_data, m_url):
+    """
+    Returns a Telegram-ready message if this match clears the bar for
+    "HOME team wins by 2+ goals", or None if it doesn't. This is the
+    only prediction this script makes.
+    """
     home = _escape_markdown(home)
     away = _escape_markdown(away)
 
     hs = home_data["stats"]
     as_ = away_data["stats"]
 
-    # Sample-size gate: refuse to signal on either team unless most of
-    # the recent matches we tried to fetch actually matched up. A
-    # small/noisy sample is the single biggest way a "high-confidence"
-    # signal turns out to be wrong.
+    # Sample-size gate: refuse to predict on either team unless the
+    # full recent-match window was actually scraped.
     if (
         hs.get("matches", 0) < MIN_SAMPLE_MATCHES
         or as_.get("matches", 0) < MIN_SAMPLE_MATCHES
@@ -1000,17 +890,11 @@ def evaluate_bet_signals(
     h_gc = hs.get("avg_gc", 0)
     a_gc = as_.get("avg_gc", 0)
 
-    h_gd = hs.get("avg_gd", 0)
-    a_gd = as_.get("avg_gd", 0)
-
     h_xg = hs.get("avg_xg")
     a_xg = as_.get("avg_xg")
 
     h_xga = hs.get("avg_xga")
     a_xga = as_.get("avg_xga")
-
-    h_xgd = hs.get("avg_xgd")
-    a_xgd = as_.get("avg_xgd")
 
     h_corners_for = hs.get("avg_corners_for")
     h_corners_against = hs.get("avg_corners_against")
@@ -1046,803 +930,124 @@ def evaluate_bet_signals(
     h_poss = hs.get("avg_possession")
     a_poss = as_.get("avg_possession")
 
-    positive = []
-    warnings = []
-
-    def add_positive(priority, text, category):
-        positive.append((priority, text, category))
-
-    def add_warning(text):
-        if text not in warnings:
-            warnings.append(text)
-
-    use_xg = (
-        h_xg is not None
-        and a_xg is not None
-        and h_xga is not None
-        and a_xga is not None
-        and h_xgd is not None
-        and a_xgd is not None
-    )
+    use_xg = h_xg is not None and a_xg is not None and h_xga is not None and a_xga is not None
 
     # -------------------------------------------------
-    # OVERPERFORMANCE WARNINGS
+    # EXPECTED MARGIN
     # -------------------------------------------------
-
-    if h_g >= 2.0 and (
-        h_xg is not None and h_xg <= 1.5
-    ):
-        add_warning(
-            f"{home} may be overperforming its finishing "
-            f"(caution on backing them blindly)"
-        )
-
-    if a_g >= 2.0 and (
-        a_xg is not None and a_xg <= 1.5
-    ):
-        add_warning(
-            f"{away} may be overperforming its finishing "
-            f"(caution on backing them blindly)"
-        )
-
-    # xGOT is a sharper version of the same check: it's shots on target
-    # weighted by quality, so goals scored well above it means a team
-    # is converting chances at a rate the shots themselves don't
-    # support — a more precise "this is due to regress" flag than
-    # comparing goals to xG alone.
-    if h_xgot_for is not None and h_g >= h_xgot_for + 0.8:
-        add_warning(
-            f"{home} scoring well above its shot quality (xGOT) — "
-            f"finishing likely unsustainable"
-        )
-
-    if a_xgot_for is not None and a_g >= a_xgot_for + 0.8:
-        add_warning(
-            f"{away} scoring well above its shot quality (xGOT) — "
-            f"finishing likely unsustainable"
-        )
-
-    # -------------------------------------------------
-    # STERILE POSSESSION WARNING
-    # -------------------------------------------------
-    # Possession alone is a weak predictor — plenty of teams win
-    # comfortably on 35% of the ball. It's only useful here as context:
-    # a team hogging the ball without anything to show for it in shots
-    # or big chances is "controlling" the game in name only, which is
-    # worth flagging on a team we're otherwise backing.
-
-    if (
-        h_poss is not None
-        and h_poss >= 58
-        and h_bc_for is not None
-        and h_bc_for <= 1.0
-    ):
-        add_warning(
-            f"{home} dominates possession ({h_poss:.0f}%) but creates "
-            f"few big chances from it — territorial control isn't "
-            f"converting into danger"
-        )
-
-    if (
-        a_poss is not None
-        and a_poss >= 58
-        and a_bc_for is not None
-        and a_bc_for <= 1.0
-    ):
-        add_warning(
-            f"{away} dominates possession ({a_poss:.0f}%) but creates "
-            f"few big chances from it — territorial control isn't "
-            f"converting into danger"
-        )
-
-    # -------------------------------------------------
-    # DEFENSIVE WEAKNESS WARNINGS
-    # -------------------------------------------------
-
-    if h_gc >= 1.8:
-        add_warning(
-            f"{home} defensive weakness: "
-            f"opponent scoring chances look high"
-        )
-
-    if a_gc >= 1.8:
-        add_warning(
-            f"{away} defensive weakness: "
-            f"opponent scoring chances look high"
-        )
-
-    # -------------------------------------------------
-    # GOALKEEPER FORM WARNING (Goals prevented)
-    # -------------------------------------------------
-    # Goals prevented = xGOT faced minus goals actually conceded.
-    # A meaningfully negative average means the keeper is conceding
-    # more than the shots they face would suggest — a defensive
-    # frailty flag that goals-conceded averages alone won't show.
-
-    if h_gp is not None and h_gp <= -0.3:
-        add_warning(
-            f"{home}'s goalkeeper has been conceding more than "
-            f"expected recently (goals prevented avg {h_gp})"
-        )
-
-    if a_gp is not None and a_gp <= -0.3:
-        add_warning(
-            f"{away}'s goalkeeper has been conceding more than "
-            f"expected recently (goals prevented avg {a_gp})"
-        )
-
-    # -------------------------------------------------
-    # WIN SCORES (both directions)
-    # -------------------------------------------------
-    # Computed unconditionally so the softer "lean" markets below
-    # (Double Chance / DNB / Handicap) have something to work with
-    # even when the strict outright-win hard filters don't pass.
-    # Use xGD when complete xG data exists, otherwise plain GD.
-
-    # xGA args passed to _win_score are always each team's own xGA —
-    # only the GD/xGD "fav vs dog" framing flips between the two calls.
-    xga_args = (h_xga, a_xga) if use_xg else (None, None)
-
-    fav_metric_h, dog_metric_h = (
-        (h_xgd, a_xgd) if use_xg else (h_gd, a_gd)
-    )
-
-    home_win_score = _win_score(
-        fav_metric_h, dog_metric_h,
-        h_g, h_gc, a_g, a_gc,
-        xga_args[0], xga_args[1]
-    )
-
-    fav_metric_a, dog_metric_a = (
-        (a_xgd, h_xgd) if use_xg else (a_gd, h_gd)
-    )
-
-    away_win_score = _win_score(
-        fav_metric_a, dog_metric_a,
-        a_g, a_gc, h_g, h_gc,
-        xga_args[1], xga_args[0]
-    )
-
-    # -------------------------------------------------
-    # HOME / AWAY WIN SIGNALS (3 Way)
-    # -------------------------------------------------
-    #
-    # HARD FILTERS (mandatory — if any condition fails for a side,
-    # that side's win signal cannot be generated):
-    #
-    # 1. Opponent must average well under a goal per game.
-    # 2. This team must concede very little.
-    #
-    # Two confidence paths, picked automatically per match:
-    #
-    #   - xG available (use_xg): score out of 14, threshold 12.
-    #   - No xG (common outside top divisions): score out of 12
-    #     (the xGA bonus categories are simply unreachable), goal
-    #     filters tightened further, and threshold raised to 10/12 to
-    #     land at roughly the same strictness as the xG path.
-    #
-    # Everything downstream (message text) is tagged with which basis
-    # actually produced the signal, so a goals-only alert never reads
-    # as equivalent to an xG-backed one.
-    # -------------------------------------------------
-
-    win_basis = "xG-based" if use_xg else "goals-based, no xG data"
+    # Each side's expected goals blends their own attacking rate with
+    # the opponent's own defensive leakiness — same "for + opponent's
+    # against" blend used throughout this script's other stats.
 
     if use_xg:
-        win_threshold = HIGH_WIN_THRESHOLD
-        win_score_max = MAX_WIN_SCORE
-        home_win_eligible = a_g < 0.6 and h_gc <= 0.6
-        away_win_eligible = h_g < 0.6 and a_gc <= 0.6
+        expected_home_goals = (h_xg + a_xga) / 2
+        expected_away_goals = (a_xg + h_xga) / 2
+        margin_buffer = XG_MARGIN_BUFFER
+        basis = "xG-based"
     else:
-        win_threshold = GD_ONLY_HIGH_THRESHOLD
-        win_score_max = GD_ONLY_MAX_SCORE
-        home_win_eligible = a_g < 0.5 and h_gc <= 0.5
-        away_win_eligible = h_g < 0.5 and a_gc <= 0.5
+        expected_home_goals = (h_g + a_gc) / 2
+        expected_away_goals = (a_g + h_gc) / 2
+        margin_buffer = GD_MARGIN_BUFFER
+        basis = "goals-based, no xG data"
 
-    home_high_conf = (
-        home_win_eligible and home_win_score >= win_threshold
+    expected_margin = expected_home_goals - expected_away_goals
+
+    # -------------------------------------------------
+    # HARD FILTERS
+    # -------------------------------------------------
+    # Necessary conditions — if any fail, this match doesn't qualify
+    # no matter how good the corroboration score looks.
+
+    hard_filters_pass = (
+        expected_home_goals >= 2.0   # home actually scores enough
+        and expected_away_goals <= 1.1  # away isn't a real threat
+        and h_gc <= 1.1               # home defense isn't leaky
+        and a_g < 1.1                 # away's raw scoring record agrees
+        and expected_margin >= (MARGIN_TARGET + margin_buffer)
     )
 
-    away_high_conf = (
-        away_win_eligible and away_win_score >= win_threshold
-    )
-
-    if home_high_conf:
-        add_positive(
-            1,
-            f"HIGH-CONFIDENCE home win signal for "
-            f"{home} ({win_basis}, "
-            f"score {home_win_score:.1f}/{win_score_max})",
-            "result"
-        )
-
-    if away_high_conf:
-        add_positive(
-            1,
-            f"HIGH-CONFIDENCE away win signal for "
-            f"{away} ({win_basis}, "
-            f"score {away_win_score:.1f}/{win_score_max})",
-            "result"
-        )
-
-    # -------------------------------------------------
-    # SHOT DOMINANCE CROSS-CHECK
-    # -------------------------------------------------
-    # A win signal built off a good goals/xG record can still be
-    # riding a couple of clinical finishes rather than real control of
-    # the game. If the side we're backing is actually being outshot on
-    # target by the side we're backing against, that's worth knowing
-    # even though it doesn't cancel the signal outright.
-
-    if (
-        home_high_conf
-        and h_sot_for is not None
-        and a_sot_against is not None
-        and h_sot_for < a_sot_against - 1.0
-    ):
-        add_warning(
-            f"{home} is being backed to win but averages fewer shots "
-            f"on target than {away} concedes — the goal record may be "
-            f"outrunning actual chance creation"
-        )
-
-    if (
-        away_high_conf
-        and a_sot_for is not None
-        and h_sot_against is not None
-        and a_sot_for < h_sot_against - 1.0
-    ):
-        add_warning(
-            f"{away} is being backed to win but averages fewer shots "
-            f"on target than {home} concedes — the goal record may be "
-            f"outrunning actual chance creation"
-        )
-
-    # -------------------------------------------------
-    # DRAW SIGNAL
-    # -------------------------------------------------
-    # Fires on a very tight metric gap, near-identical scoring rates,
-    # and neither side anywhere close to a win signal — a draw lean is
-    # specifically "these two are genuinely hard to separate", not
-    # just "no win signal happened to trigger". Same two-path split as
-    # the win signals: xGD when available, plain GD (with a slightly
-    # wider gap allowance) when not.
-
-    if use_xg:
-        draw_metric_gap = abs(h_xgd - a_xgd)
-        draw_signal = (
-            draw_metric_gap <= 0.1
-            and abs(h_g - a_g) <= 0.2
-            and home_win_score < win_threshold - 2
-            and away_win_score < win_threshold - 2
-        )
-    else:
-        draw_metric_gap = abs(h_gd - a_gd)
-        draw_signal = (
-            draw_metric_gap <= 0.15
-            and abs(h_g - a_g) <= 0.25
-            and home_win_score < win_threshold - 2
-            and away_win_score < win_threshold - 2
-        )
-
-    if draw_signal:
-        draw_text = (
-            f"Draw signal ({win_basis}): {home} and {away} closely "
-            f"matched in current form (metric gap {draw_metric_gap:.2f})"
-        )
-
-        # Possession is weak on its own, but even territorial control
-        # is a reasonable extra corroboration for a signal that's
-        # already claiming "these two are hard to separate".
-        if (
-            h_poss is not None
-            and a_poss is not None
-            and abs(h_poss - a_poss) <= 6
-        ):
-            draw_text += " — territorial control also even"
-
-        add_positive(2, draw_text, "result")
-
-    # -------------------------------------------------
-    # MATCH LEAN -> DOUBLE CHANCE / DNB / HANDICAP
-    # -------------------------------------------------
-    # These ride strictly on the HIGH-CONFIDENCE win/draw signals above
-    # — no separate, softer threshold. If we're not confident enough
-    # for an outright signal, we're not confident enough for these
-    # either.
-
-    if home_high_conf:
-        lean = "home"
-    elif away_high_conf:
-        lean = "away"
-    elif draw_signal:
-        lean = "draw"
-    else:
-        lean = None
-
-    if lean == "home":
-        add_positive(
-            2,
-            f"Double Chance lean: {home} or Draw (1X)",
-            "result"
-        )
-        add_positive(
-            2,
-            f"Draw No Bet lean: {home}",
-            "result"
-        )
-
-    elif lean == "away":
-        add_positive(
-            2,
-            f"Double Chance lean: Draw or {away} (X2)",
-            "result"
-        )
-        add_positive(
-            2,
-            f"Draw No Bet lean: {away}",
-            "result"
-        )
-
-    # Handicap direction: bucket the metric gap on the leaning side's
-    # favour into a rough line suggestion. Only meaningful for a
-    # home/away lean, not a draw lean.
-
-    if lean == "home":
-        handicap_gap = fav_metric_h - dog_metric_h
-        handicap_team = home
-    elif lean == "away":
-        handicap_gap = fav_metric_a - dog_metric_a
-        handicap_team = away
-    else:
-        handicap_gap = None
-        handicap_team = None
-
-    if handicap_gap is not None:
-        if handicap_gap >= 3.5:
-            add_positive(
-                2,
-                f"Handicap lean: {handicap_team} -1 (or better)",
-                "result"
-            )
-        elif handicap_gap >= 2.5:
-            add_positive(
-                2,
-                f"Handicap lean: {handicap_team} -0.5/-1",
-                "result"
-            )
-        elif handicap_gap >= 1.5:
-            add_positive(
-                2,
-                f"Handicap lean: {handicap_team} -0.5",
-                "result"
-            )
-
-    # -------------------------------------------------
-    # LOW GOAL / UNDER 2.5 SIGNAL (strict) + TOTAL GOALS LADDER
-    # -------------------------------------------------
-
-    low_goal_signal_fired = False
-
-    if use_xg:
-
-        conditions_met = 0
-
-        # Both teams create few chances
-        if h_xg <= 0.65 and a_xg <= 0.65:
-            conditions_met += 1
-
-        # Both teams concede few chances
-        if h_xga <= 0.85 and a_xga <= 0.85:
-            conditions_met += 1
-
-        # Teams have similar xGD
-        if abs(h_xgd - a_xgd) <= 0.2:
-            conditions_met += 1
-
-        if conditions_met == 3:
-            add_positive(
-                3,
-                "Strong low-goal signal (xG-based): likely Under 2.5",
-                "goals"
-            )
-            low_goal_signal_fired = True
-
-    else:
-
-        conditions_met = 0
-
-        # Both teams score little themselves
-        if h_g <= 0.7 and a_g <= 0.7:
-            conditions_met += 1
-
-        # Both teams concede little
-        if h_gc <= 0.85 and a_gc <= 0.85:
-            conditions_met += 1
-
-        # Similar goal difference (no lopsided form skewing it)
-        if abs(h_gd - a_gd) <= 0.2:
-            conditions_met += 1
-
-        if conditions_met == 3:
-            add_positive(
-                3,
-                "Strong low-goal signal (goals-based, no xG data): "
-                "likely Under 2.5",
-                "goals"
-            )
-            low_goal_signal_fired = True
-
-    # Combined + per-team Over/Under ladder (0.5-4.5). Uses xG when
-    # available; falls back to plain averaged goals with a wider margin
-    # (TOTAL_GOAL_MARGIN_GD) otherwise, since raw goals-per-game swings
-    # more match to match than xG does. Skipped for the match total
-    # when the strict signal above already covered it, to avoid two
-    # near-duplicate Under 2.5 lines in the same alert.
-
-    if use_xg:
-        combined_expected_goals = h_xg + a_xg
-        home_expected_goals = h_xg
-        away_expected_goals = a_xg
-        goals_margin = TOTAL_GOAL_MARGIN
-        goals_basis = "xG-based"
-    else:
-        combined_expected_goals = h_g + a_g
-        home_expected_goals = h_g
-        away_expected_goals = a_g
-        goals_margin = TOTAL_GOAL_MARGIN_GD
-        goals_basis = "goals-based"
-
-    if not low_goal_signal_fired:
-        total_goals_signal = _total_goals_lean(
-            combined_expected_goals,
-            f"Total Goals ({goals_basis})",
-            margin=goals_margin
-        )
-        if total_goals_signal:
-            add_positive(*total_goals_signal)
-
-    home_goals_signal = _total_goals_lean(
-        home_expected_goals,
-        f"{home} Total Goals ({goals_basis})",
-        margin=goals_margin
-    )
-    if home_goals_signal:
-        add_positive(*home_goals_signal)
-
-    away_goals_signal = _total_goals_lean(
-        away_expected_goals,
-        f"{away} Total Goals ({goals_basis})",
-        margin=goals_margin
-    )
-    if away_goals_signal:
-        add_positive(*away_goals_signal)
-
-    # Coarse Over/Under 2.5 direction, reused by the combo markets
-    # below regardless of which specific line the ladder picked. The
-    # goals-only fallback needs a wider buffer than the xG version for
-    # the same reason as the ladder margin above.
-    goals_combo_dir = None
-
-    if use_xg:
-        if combined_expected_goals >= 3.4:
-            goals_combo_dir = "Over 2.5"
-        elif combined_expected_goals <= 1.6:
-            goals_combo_dir = "Under 2.5"
-    else:
-        if combined_expected_goals >= 3.8:
-            goals_combo_dir = "Over 2.5"
-        elif combined_expected_goals <= 1.2:
-            goals_combo_dir = "Under 2.5"
-
-    # -------------------------------------------------
-    # CORNERS SIGNAL (Over/Under)
-    # -------------------------------------------------
-    # Expected total corners blends each team's own corner rate with
-    # what their opponent's profile tends to concede, so a team that
-    # wins a lot of corners *and* faces an opponent who concedes a lot
-    # of corners pushes the total up (and vice versa for Under).
-
-    corners_data_complete = all(
-        v is not None
-        for v in [
-            h_corners_for, h_corners_against,
-            a_corners_for, a_corners_against
-        ]
-    )
-
-    if corners_data_complete:
-        expected_corners = (
-            h_corners_for + a_corners_against
-            + a_corners_for + h_corners_against
-        ) / 2
-
-        # Require both teams' own tendencies to individually point the
-        # same direction, not just a combined average — one lopsided
-        # match shouldn't be enough to swing the whole signal.
-        both_high = (
-            h_corners_for >= 6.0
-            and a_corners_against >= 6.0
-            and a_corners_for >= 6.0
-            and h_corners_against >= 6.0
-        )
-        both_low = (
-            h_corners_for <= 4.0
-            and a_corners_against <= 4.0
-            and a_corners_for <= 4.0
-            and h_corners_against <= 4.0
-        )
-
-        if expected_corners >= 13.0 and both_high:
-            add_positive(
-                2,
-                f"Corners signal: likely Over 9.5 corners "
-                f"(expected ~{expected_corners:.1f})",
-                "corners_cards"
-            )
-
-        elif expected_corners <= 5.5 and both_low:
-            add_positive(
-                2,
-                f"Corners signal: likely Under 8.5 corners "
-                f"(expected ~{expected_corners:.1f})",
-                "corners_cards"
-            )
-
-    # -------------------------------------------------
-    # SHOTS ON TARGET SIGNAL (Over/Under)
-    # -------------------------------------------------
-    # Same shape as the corners signal: blend each team's own rate
-    # with what their opponent tends to concede, and require both
-    # teams' individual for/against numbers to independently agree
-    # with the direction — not just a combined average one lopsided
-    # match could produce.
-
-    sot_data_complete = all(
-        v is not None
-        for v in [h_sot_for, h_sot_against, a_sot_for, a_sot_against]
-    )
-
-    if sot_data_complete:
-        expected_sot = (
-            h_sot_for + a_sot_against
-            + a_sot_for + h_sot_against
-        ) / 2
-
-        sot_both_high = (
-            h_sot_for >= 5.0
-            and a_sot_against >= 5.0
-            and a_sot_for >= 5.0
-            and h_sot_against >= 5.0
-        )
-        sot_both_low = (
-            h_sot_for <= 2.5
-            and a_sot_against <= 2.5
-            and a_sot_for <= 2.5
-            and h_sot_against <= 2.5
-        )
-
-        if expected_sot >= 9.5 and sot_both_high:
-            add_positive(
-                2,
-                f"Shots on Target signal: likely Over 7.5 "
-                f"(expected ~{expected_sot:.1f})",
-                "shots"
-            )
-
-        elif expected_sot <= 4.5 and sot_both_low:
-            add_positive(
-                2,
-                f"Shots on Target signal: likely Under 6.5 "
-                f"(expected ~{expected_sot:.1f})",
-                "shots"
-            )
-
-    # -------------------------------------------------
-    # CARDS SIGNAL (Over/Under)
-    # -------------------------------------------------
-    # Cards average alone is noisy (ref-dependent), so this only
-    # fires when it's corroborated by a high combined fouls count.
-
-    if (
-        h_cards is not None
-        and a_cards is not None
-        and h_fouls is not None
-        and a_fouls is not None
-    ):
-        expected_cards = h_cards + a_cards
-        combined_fouls = h_fouls + a_fouls
-
-        if expected_cards >= 6.0 and combined_fouls >= 26:
-            add_positive(
-                2,
-                f"Cards signal: likely Over 3.5 cards "
-                f"(expected ~{expected_cards:.1f}, "
-                f"combined fouls ~{combined_fouls:.0f})",
-                "corners_cards"
-            )
-
-        elif expected_cards <= 1.5 and combined_fouls <= 9:
-            add_positive(
-                2,
-                f"Cards signal: likely Under 3.5 cards "
-                f"(expected ~{expected_cards:.1f}, "
-                f"combined fouls ~{combined_fouls:.0f})",
-                "corners_cards"
-            )
-
-    # -------------------------------------------------
-    # BTTS SIGNAL (Both Teams To Score)
-    # -------------------------------------------------
-    # Big chances created AND conceded by both sides is a better BTTS
-    # predictor than raw goals, since it isn't skewed by finishing
-    # variance the way goals-per-game can be.
-
-    btts_data_complete = all(
-        v is not None
-        for v in [h_bc_for, a_bc_for, h_bc_against, a_bc_against]
-    )
-
-    # Big chances (like corners/cards) are a basic match stat Flashscore
-    # publishes independently of whether it has an xG model for this
-    # competition, so this doesn't need use_xg — it has its own data
-    # quality bar via btts_data_complete + the thresholds below.
-    btts_signal_fired = (
-        btts_data_complete
-        and h_g >= 1.5
-        and a_g >= 1.5
-        and h_bc_against >= 2.0
-        and a_bc_against >= 2.0
-    )
-
-    if btts_signal_fired:
-        add_positive(
-            2,
-            "BTTS signal: both teams create and concede "
-            "big chances regularly",
-            "goals"
-        )
-
-    # -------------------------------------------------
-    # CLEAN SHEET / WIN TO NIL
-    # -------------------------------------------------
-    # A team keeps a clean sheet when the opponent rarely scores/
-    # creates (goals and xG both low) and this team's own defence
-    # holds up. Win to Nil layers that on top of an eligible win lean.
-
-    if use_xg:
-        home_clean_sheet = a_g <= 0.4 and h_gc <= 0.5 and a_xg <= 0.6
-        away_clean_sheet = h_g <= 0.4 and a_gc <= 0.5 and h_xg <= 0.6
-    else:
-        # No xG to corroborate with, so lean on goals alone but with a
-        # tighter bar to compensate.
-        home_clean_sheet = a_g <= 0.25 and h_gc <= 0.35
-        away_clean_sheet = h_g <= 0.25 and a_gc <= 0.35
-
-    if home_clean_sheet:
-        add_positive(
-            2,
-            f"{home} Clean Sheet signal: {away} rarely scores "
-            f"and {home} defends well",
-            "clean_sheet"
-        )
-
-    if away_clean_sheet:
-        add_positive(
-            2,
-            f"{away} Clean Sheet signal: {home} rarely scores "
-            f"and {away} defends well",
-            "clean_sheet"
-        )
-
-    if home_clean_sheet and home_high_conf:
-        add_positive(1, f"{home} Win to Nil signal", "clean_sheet")
-
-    if away_clean_sheet and away_high_conf:
-        add_positive(1, f"{away} Win to Nil signal", "clean_sheet")
-
-    # A clean sheet on either side is a reasonable proxy for "BTTS No"
-    # even when the BTTS-Yes conditions above didn't fire.
-    btts_no_signal = home_clean_sheet or away_clean_sheet
-
-    # -------------------------------------------------
-    # COMBO MARKETS
-    # -------------------------------------------------
-    # 3 Way & BTTS, 1x2 & Total Goals, Total Goals & BTTS. Each only
-    # fires when both halves of the combo have an actual directional
-    # read — never guessed just to fill in a combo.
-
-    if lean in ("home", "away"):
-        combo_team = home if lean == "home" else away
-
-        if btts_signal_fired:
-            add_positive(3, f"Combo: {combo_team} win & BTTS Yes", "combo")
-        elif btts_no_signal:
-            add_positive(3, f"Combo: {combo_team} win & BTTS No", "combo")
-
-        if goals_combo_dir:
-            add_positive(
-                3,
-                f"Combo: {combo_team} win & {goals_combo_dir}",
-                "combo"
-            )
-
-    if goals_combo_dir == "Over 2.5" and btts_signal_fired:
-        add_positive(3, "Combo: Over 2.5 & BTTS Yes", "combo")
-
-    elif goals_combo_dir == "Under 2.5" and btts_no_signal:
-        add_positive(3, "Combo: Under 2.5 & BTTS No", "combo")
-
-    # -------------------------------------------------
-    # FINAL OUTPUT
-    # -------------------------------------------------
-
-    if not positive:
+    if not hard_filters_pass:
         return None
 
-    positive.sort(key=lambda x: x[0])
+    # -------------------------------------------------
+    # CORROBORATION
+    # -------------------------------------------------
 
-    best_signal = positive[0][1]
+    margin_score = _margin_score(
+        h_sot_for, a_sot_against,
+        h_bc_for, a_bc_against,
+        a_bc_for, h_bc_against,
+        h_corners_for, a_corners_against,
+        a_xgot_for, a_g,
+    )
+
+    if margin_score < MARGIN_SCORE_THRESHOLD:
+        return None
+
+    # -------------------------------------------------
+    # RISK FACTORS (shown, don't block the prediction)
+    # -------------------------------------------------
+
+    risks = []
+
+    if h_xg is not None and h_g >= h_xg + 1.0:
+        risks.append(
+            f"{home} may be overperforming its xG — some regression "
+            f"toward a smaller margin is possible"
+        )
+
+    if h_gc >= 1.0:
+        risks.append(
+            f"{home} has been conceding at a rate that could keep "
+            f"the margin tighter than expected"
+        )
+
+    if (
+        h_poss is not None and h_poss >= 58
+        and h_bc_for is not None and h_bc_for <= 1.0
+    ):
+        risks.append(
+            f"{home} tends to dominate the ball without creating "
+            f"many big chances from it — territorial control alone "
+            f"won't guarantee the margin"
+        )
+
+    # -------------------------------------------------
+    # MESSAGE
+    # -------------------------------------------------
 
     def fmt(v):
         return "N/A" if v is None else str(v)
 
-    # Bucket every fired signal into its market category, preserving
-    # the priority ordering already applied above within each bucket.
-    grouped = {cat: [] for cat in CATEGORY_ORDER}
-    for _, text, category in positive:
-        grouped.setdefault(category, []).append(text)
-
     lines = [
         f"⚽ *{home} vs {away}*",
         "",
-        "🎯 *Best signal*",
-        best_signal,
+        f"🎯 *Prediction: {home} to win by 2+ goals* ({basis})",
+        f"Expected margin ~{expected_margin:.2f} "
+        f"(home ~{expected_home_goals:.2f}, away ~{expected_away_goals:.2f}) "
+        f"| corroboration score {margin_score:.1f}",
         "",
-    ]
-
-    for cat in CATEGORY_ORDER:
-        entries = grouped.get(cat) or []
-        if not entries:
-            continue
-        lines.append(CATEGORY_LABELS[cat])
-        lines.extend(f"• {e}" for e in entries)
-        lines.append("")
-
-    lines.append("📊 *Stats*")
-    lines.append(
-        f"{home}   G {h_g} | GA {h_gc} | GD {h_gd} | "
-        f"xG {fmt(h_xg)} | xGA {fmt(h_xga)} | xGD {fmt(h_xgd)}"
-    )
-    lines.append(
-        f"{away}   G {a_g} | GA {a_gc} | GD {a_gd} | "
-        f"xG {fmt(a_xg)} | xGA {fmt(a_xga)} | xGD {fmt(a_xgd)}"
-    )
-    lines.append(
-        f"Possession {fmt(h_poss)}% vs {fmt(a_poss)}%"
-    )
-    lines.append(
+        "📊 *Stats*",
+        f"{home}   G {h_g} | GA {h_gc} | xG {fmt(h_xg)} | xGA {fmt(h_xga)}",
+        f"{away}   G {a_g} | GA {a_gc} | xG {fmt(a_xg)} | xGA {fmt(a_xga)}",
+        f"Possession {fmt(h_poss)}% vs {fmt(a_poss)}%",
         f"Shots {fmt(h_shots_for)}/{fmt(h_shots_against)} vs "
         f"{fmt(a_shots_for)}/{fmt(a_shots_against)} | "
         f"SoT {fmt(h_sot_for)}/{fmt(h_sot_against)} vs "
-        f"{fmt(a_sot_for)}/{fmt(a_sot_against)}"
-    )
-    lines.append(
+        f"{fmt(a_sot_for)}/{fmt(a_sot_against)}",
         f"Corners {fmt(h_corners_for)}/{fmt(h_corners_against)} vs "
         f"{fmt(a_corners_for)}/{fmt(a_corners_against)} | "
         f"BigCh {fmt(h_bc_for)}/{fmt(h_bc_against)} vs "
-        f"{fmt(a_bc_for)}/{fmt(a_bc_against)}"
-    )
-    lines.append(
+        f"{fmt(a_bc_for)}/{fmt(a_bc_against)}",
         f"Cards {fmt(h_cards)} vs {fmt(a_cards)} | "
         f"Fouls {fmt(h_fouls)} vs {fmt(a_fouls)} | "
-        f"GP {fmt(h_gp)} vs {fmt(a_gp)}"
-    )
-    lines.append("")
+        f"GP {fmt(h_gp)} vs {fmt(a_gp)}",
+        "",
+    ]
 
-    if warnings:
-        lines.append(f"⚠️ *Cautions ({len(warnings)})*")
-        lines.extend(f"• {w}" for w in warnings)
+    if risks:
+        lines.append(f"⚠️ *Risk factors ({len(risks)})*")
+        lines.extend(f"• {r}" for r in risks)
         lines.append("")
 
     lines.append(f"🔗 {m_url}")
@@ -2011,7 +1216,7 @@ def main():
 
                     continue
 
-                msg = evaluate_bet_signals(
+                msg = evaluate_home_margin_signal(
                     home,
                     away,
                     home_data,
