@@ -974,8 +974,8 @@ def _escape_markdown(text):
 def evaluate_home_margin_signal(home, away, home_data, away_data, m_url):
     """
     Returns a Telegram-ready message if this match clears the bar for
-    "HOME team wins by 2+ goals", or None if it doesn't. This is the
-    only prediction this script makes.
+    "HOME team wins by 2+ goals", or None if it doesn't. Mirrored by
+    evaluate_away_margin_signal below for the away side.
     """
     home = _escape_markdown(home)
     away = _escape_markdown(away)
@@ -1133,6 +1133,828 @@ def evaluate_home_margin_signal(home, away, home_data, away_data, m_url):
         f"Expected margin ~{expected_margin:.2f} "
         f"(home ~{expected_home_goals:.2f}, away ~{expected_away_goals:.2f}) "
         f"| corroboration score {margin_score:.1f}",
+        "",
+        "📊 *Stats*",
+        f"{home}   G {h_g} | GA {h_gc} | xG {fmt(h_xg)} | xGA {fmt(h_xga)}",
+        f"{away}   G {a_g} | GA {a_gc} | xG {fmt(a_xg)} | xGA {fmt(a_xga)}",
+        f"Possession {fmt(h_poss)}% vs {fmt(a_poss)}%",
+        f"Shots {fmt(h_shots_for)}/{fmt(h_shots_against)} vs "
+        f"{fmt(a_shots_for)}/{fmt(a_shots_against)} | "
+        f"SoT {fmt(h_sot_for)}/{fmt(h_sot_against)} vs "
+        f"{fmt(a_sot_for)}/{fmt(a_sot_against)}",
+        f"Corners {fmt(h_corners_for)}/{fmt(h_corners_against)} vs "
+        f"{fmt(a_corners_for)}/{fmt(a_corners_against)} | "
+        f"BigCh {fmt(h_bc_for)}/{fmt(h_bc_against)} vs "
+        f"{fmt(a_bc_for)}/{fmt(a_bc_against)}",
+        f"Cards {fmt(h_cards)} vs {fmt(a_cards)} | "
+        f"Fouls {fmt(h_fouls)} vs {fmt(a_fouls)} | "
+        f"GP {fmt(h_gp)} vs {fmt(a_gp)}",
+        "",
+    ]
+
+    if risks:
+        lines.append(f"⚠️ *Risk factors ({len(risks)})*")
+        lines.extend(f"• {r}" for r in risks)
+        lines.append("")
+
+    lines.append(f"🔗 {m_url}")
+
+    return "\n".join(lines)
+
+
+def evaluate_away_margin_signal(home, away, home_data, away_data, m_url):
+    """
+    Mirror image of evaluate_home_margin_signal: returns a message if
+    this match clears the bar for "AWAY team wins by 2+ goals", or
+    None. Every home/away role in the margin logic is swapped, but the
+    thresholds, buffers, and _margin_score corroboration function are
+    identical — reused directly with home/away arguments swapped
+    pairwise, since _margin_score's parameters are really "the side
+    we're backing" and "the side we're backing against", just named
+    h_/a_ from how the home version happens to call it.
+    """
+    home = _escape_markdown(home)
+    away = _escape_markdown(away)
+
+    hs = home_data["stats"]
+    as_ = away_data["stats"]
+
+    if (
+        hs.get("matches", 0) < MIN_SAMPLE_MATCHES
+        or as_.get("matches", 0) < MIN_SAMPLE_MATCHES
+    ):
+        return None
+
+    h_g = hs.get("avg_goals", 0)
+    a_g = as_.get("avg_goals", 0)
+
+    h_gc = hs.get("avg_gc", 0)
+    a_gc = as_.get("avg_gc", 0)
+
+    h_xg = hs.get("avg_xg")
+    a_xg = as_.get("avg_xg")
+
+    h_xga = hs.get("avg_xga")
+    a_xga = as_.get("avg_xga")
+
+    h_corners_for = hs.get("avg_corners_for")
+    h_corners_against = hs.get("avg_corners_against")
+    a_corners_for = as_.get("avg_corners_for")
+    a_corners_against = as_.get("avg_corners_against")
+
+    h_bc_for = hs.get("avg_big_chances_for")
+    h_bc_against = hs.get("avg_big_chances_against")
+    a_bc_for = as_.get("avg_big_chances_for")
+    a_bc_against = as_.get("avg_big_chances_against")
+
+    h_cards = hs.get("avg_yellow_cards")
+    a_cards = as_.get("avg_yellow_cards")
+    h_fouls = hs.get("avg_fouls")
+    a_fouls = as_.get("avg_fouls")
+
+    h_gp = hs.get("avg_goals_prevented")
+    a_gp = as_.get("avg_goals_prevented")
+
+    h_shots_for = hs.get("avg_shots_for")
+    h_shots_against = hs.get("avg_shots_against")
+    a_shots_for = as_.get("avg_shots_for")
+    a_shots_against = as_.get("avg_shots_against")
+
+    h_sot_for = hs.get("avg_sot_for")
+    h_sot_against = hs.get("avg_sot_against")
+    a_sot_for = as_.get("avg_sot_for")
+    a_sot_against = as_.get("avg_sot_against")
+
+    h_xgot_for = hs.get("avg_xgot_for")
+    a_xgot_for = as_.get("avg_xgot_for")
+
+    h_poss = hs.get("avg_possession")
+    a_poss = as_.get("avg_possession")
+
+    use_xg = h_xg is not None and a_xg is not None and h_xga is not None and a_xga is not None
+
+    # -------------------------------------------------
+    # EXPECTED MARGIN (away's perspective)
+    # -------------------------------------------------
+
+    if use_xg:
+        expected_home_goals = (h_xg + a_xga) / 2
+        expected_away_goals = (a_xg + h_xga) / 2
+        margin_buffer = XG_MARGIN_BUFFER
+        basis = "xG-based"
+    else:
+        expected_home_goals = (h_g + a_gc) / 2
+        expected_away_goals = (a_g + h_gc) / 2
+        margin_buffer = GD_MARGIN_BUFFER
+        basis = "goals-based, no xG data"
+
+    expected_margin = expected_away_goals - expected_home_goals
+
+    # -------------------------------------------------
+    # HARD FILTERS (away as the favourite, home as the underdog)
+    # -------------------------------------------------
+
+    hard_filters_pass = (
+        expected_away_goals >= 2.0   # away actually scores enough
+        and expected_home_goals <= 1.1  # home isn't a real threat
+        and a_gc <= 1.1               # away defense isn't leaky
+        and h_g < 1.1                 # home's raw scoring record agrees
+        and expected_margin >= (MARGIN_TARGET + margin_buffer)
+    )
+
+    if not hard_filters_pass:
+        return None
+
+    # -------------------------------------------------
+    # CORROBORATION — _margin_score with every home/away pair swapped
+    # -------------------------------------------------
+
+    margin_score = _margin_score(
+        a_sot_for, h_sot_against,
+        a_bc_for, h_bc_against,
+        h_bc_for, a_bc_against,
+        a_corners_for, h_corners_against,
+        h_xgot_for, h_g,
+    )
+
+    if margin_score < MARGIN_SCORE_THRESHOLD:
+        return None
+
+    # -------------------------------------------------
+    # RISK FACTORS
+    # -------------------------------------------------
+
+    risks = []
+
+    if a_xg is not None and a_g >= a_xg + 1.0:
+        risks.append(
+            f"{away} may be overperforming its xG — some regression "
+            f"toward a smaller margin is possible"
+        )
+
+    if a_gc >= 1.0:
+        risks.append(
+            f"{away} has been conceding at a rate that could keep "
+            f"the margin tighter than expected"
+        )
+
+    if (
+        a_poss is not None and a_poss >= 58
+        and a_bc_for is not None and a_bc_for <= 1.0
+    ):
+        risks.append(
+            f"{away} tends to dominate the ball without creating "
+            f"many big chances from it — territorial control alone "
+            f"won't guarantee the margin"
+        )
+
+    # -------------------------------------------------
+    # MESSAGE
+    # -------------------------------------------------
+
+    def fmt(v):
+        return "N/A" if v is None else str(v)
+
+    lines = [
+        f"⚽ *{home} vs {away}*",
+        "",
+        f"🎯 *Prediction: {away} to win by 2+ goals* ({basis})",
+        f"Expected margin ~{expected_margin:.2f} "
+        f"(away ~{expected_away_goals:.2f}, home ~{expected_home_goals:.2f}) "
+        f"| corroboration score {margin_score:.1f}",
+        "",
+        "📊 *Stats*",
+        f"{home}   G {h_g} | GA {h_gc} | xG {fmt(h_xg)} | xGA {fmt(h_xga)}",
+        f"{away}   G {a_g} | GA {a_gc} | xG {fmt(a_xg)} | xGA {fmt(a_xga)}",
+        f"Possession {fmt(h_poss)}% vs {fmt(a_poss)}%",
+        f"Shots {fmt(h_shots_for)}/{fmt(h_shots_against)} vs "
+        f"{fmt(a_shots_for)}/{fmt(a_shots_against)} | "
+        f"SoT {fmt(h_sot_for)}/{fmt(h_sot_against)} vs "
+        f"{fmt(a_sot_for)}/{fmt(a_sot_against)}",
+        f"Corners {fmt(h_corners_for)}/{fmt(h_corners_against)} vs "
+        f"{fmt(a_corners_for)}/{fmt(a_corners_against)} | "
+        f"BigCh {fmt(h_bc_for)}/{fmt(h_bc_against)} vs "
+        f"{fmt(a_bc_for)}/{fmt(a_bc_against)}",
+        f"Cards {fmt(h_cards)} vs {fmt(a_cards)} | "
+        f"Fouls {fmt(h_fouls)} vs {fmt(a_fouls)} | "
+        f"GP {fmt(h_gp)} vs {fmt(a_gp)}",
+        "",
+    ]
+
+    if risks:
+        lines.append(f"⚠️ *Risk factors ({len(risks)})*")
+        lines.extend(f"• {r}" for r in risks)
+        lines.append("")
+
+    lines.append(f"🔗 {m_url}")
+
+    return "\n".join(lines)
+
+
+# -------------------------------------------------
+# HOME CLEAN SHEET PREDICTION
+# -------------------------------------------------
+# Second, independent prediction: HOME team keeps a clean sheet (away
+# team fails to score). Same strictness philosophy and for+against
+# blended-expectation approach as the margin prediction above — full
+# sample, a buffered expected-goals gate, corroboration from the extra
+# stats. Independent of evaluate_home_margin_signal: a match can fire
+# either, both, or neither (e.g. a predicted 1-0 fires this but not
+# the margin signal; a predicted 3-1 fires the margin signal but not
+# this one).
+
+CS_XG_AWAY_TARGET = 0.35   # xG-based: expected away goals must sit under this
+CS_GD_AWAY_TARGET = 0.3    # goals-only fallback: tighter, no shot-quality backup
+CS_SCORE_THRESHOLD = 3.0   # corroboration bar (see _clean_sheet_score)
+
+
+def _clean_sheet_score(
+    a_sot_for, h_sot_against,
+    a_bc_for, h_bc_against,
+    a_corners_for, h_corners_against,
+    h_gp,
+    a_xgot_for, a_g,
+):
+    """
+    Corroboration score for "home keeps a clean sheet" — the mirror
+    image of _margin_score: here we want AWAY's creation numbers
+    (blended with what HOME concedes) to be LOW, not high. Same
+    for+against blended-expectation approach as everywhere else in
+    this script. All args are None-safe.
+    """
+    score = 0.0
+
+    if a_sot_for is not None and h_sot_against is not None:
+        expected_away_sot = (a_sot_for + h_sot_against) / 2
+        if expected_away_sot <= 2.5:
+            score += 2
+        elif expected_away_sot <= 3.5:
+            score += 1
+
+    if a_bc_for is not None and h_bc_against is not None:
+        expected_away_bc = (a_bc_for + h_bc_against) / 2
+        if expected_away_bc <= 0.7:
+            score += 2
+        elif expected_away_bc <= 1.2:
+            score += 1
+
+    if a_corners_for is not None and h_corners_against is not None:
+        expected_away_corners = (a_corners_for + h_corners_against) / 2
+        if expected_away_corners <= 3.5:
+            score += 1
+        elif expected_away_corners <= 4.5:
+            score += 0.5
+
+    # A home keeper who's been outperforming their shot quality is
+    # extra corroboration for a clean sheet holding up.
+    if h_gp is not None and h_gp >= 0.2:
+        score += 1
+
+    # Same regression flag as the margin signal: away scoring above
+    # its own shot quality is a risk to a clean sheet even against
+    # otherwise weak-looking averages.
+    if a_xgot_for is not None and a_g >= a_xgot_for + 0.8:
+        score -= 1.5
+
+    return score
+
+
+def evaluate_home_clean_sheet_signal(home, away, home_data, away_data, m_url):
+    """
+    Returns a Telegram-ready message if this match clears the bar for
+    "HOME team keeps a clean sheet" (away fails to score), or None.
+    """
+    home = _escape_markdown(home)
+    away = _escape_markdown(away)
+
+    hs = home_data["stats"]
+    as_ = away_data["stats"]
+
+    if (
+        hs.get("matches", 0) < MIN_SAMPLE_MATCHES
+        or as_.get("matches", 0) < MIN_SAMPLE_MATCHES
+    ):
+        return None
+
+    h_g = hs.get("avg_goals", 0)
+    a_g = as_.get("avg_goals", 0)
+
+    h_gc = hs.get("avg_gc", 0)
+    a_gc = as_.get("avg_gc", 0)
+
+    h_xg = hs.get("avg_xg")
+    a_xg = as_.get("avg_xg")
+
+    h_xga = hs.get("avg_xga")
+    a_xga = as_.get("avg_xga")
+
+    h_corners_for = hs.get("avg_corners_for")
+    h_corners_against = hs.get("avg_corners_against")
+    a_corners_for = as_.get("avg_corners_for")
+    a_corners_against = as_.get("avg_corners_against")
+
+    h_bc_for = hs.get("avg_big_chances_for")
+    h_bc_against = hs.get("avg_big_chances_against")
+    a_bc_for = as_.get("avg_big_chances_for")
+    a_bc_against = as_.get("avg_big_chances_against")
+
+    h_cards = hs.get("avg_yellow_cards")
+    a_cards = as_.get("avg_yellow_cards")
+    h_fouls = hs.get("avg_fouls")
+    a_fouls = as_.get("avg_fouls")
+
+    h_gp = hs.get("avg_goals_prevented")
+    a_gp = as_.get("avg_goals_prevented")
+
+    h_shots_for = hs.get("avg_shots_for")
+    h_shots_against = hs.get("avg_shots_against")
+    a_shots_for = as_.get("avg_shots_for")
+    a_shots_against = as_.get("avg_shots_against")
+
+    h_sot_for = hs.get("avg_sot_for")
+    h_sot_against = hs.get("avg_sot_against")
+    a_sot_for = as_.get("avg_sot_for")
+    a_sot_against = as_.get("avg_sot_against")
+
+    a_xgot_for = as_.get("avg_xgot_for")
+
+    h_poss = hs.get("avg_possession")
+    a_poss = as_.get("avg_possession")
+
+    use_xg = (
+        h_xg is not None and a_xg is not None
+        and h_xga is not None and a_xga is not None
+    )
+
+    if use_xg:
+        expected_away_goals = (a_xg + h_xga) / 2
+        away_target = CS_XG_AWAY_TARGET
+        basis = "xG-based"
+    else:
+        expected_away_goals = (a_g + h_gc) / 2
+        away_target = CS_GD_AWAY_TARGET
+        basis = "goals-based, no xG data"
+
+    # Hard filters — necessary conditions, checked with plain goals as
+    # well as the xG-blended estimate so this isn't trusting xG alone.
+    hard_filters_pass = (
+        expected_away_goals <= away_target
+        and a_g <= 0.5    # away's raw scoring record agrees
+        and h_gc <= 0.6   # home's own defensive record is solid
+    )
+
+    if not hard_filters_pass:
+        return None
+
+    cs_score = _clean_sheet_score(
+        a_sot_for, h_sot_against,
+        a_bc_for, h_bc_against,
+        a_corners_for, h_corners_against,
+        h_gp,
+        a_xgot_for, a_g,
+    )
+
+    if cs_score < CS_SCORE_THRESHOLD:
+        return None
+
+    risks = []
+
+    if a_xg is not None and a_g >= a_xg + 0.6:
+        risks.append(
+            f"{away} may be underperforming its xG recently — some "
+            f"regression toward actually scoring is possible"
+        )
+
+    if h_gp is not None and h_gp <= -0.2:
+        risks.append(
+            f"{home}'s goalkeeper has been conceding more than shot "
+            f"quality suggests — the clean sheet record may be "
+            f"shakier than the raw averages imply"
+        )
+
+    if (
+        a_poss is not None and a_poss >= 55
+        and a_bc_for is not None and a_bc_for >= 2.0
+    ):
+        risks.append(
+            f"{away} still creates meaningful chances despite a low "
+            f"scoring record — a clean sheet isn't guaranteed just "
+            f"because they haven't been converting"
+        )
+
+    def fmt(v):
+        return "N/A" if v is None else str(v)
+
+    lines = [
+        f"⚽ *{home} vs {away}*",
+        "",
+        f"🧤 *Prediction: {home} to keep a clean sheet* ({basis})",
+        f"Expected {away} goals ~{expected_away_goals:.2f} | "
+        f"corroboration score {cs_score:.1f}",
+        "",
+        "📊 *Stats*",
+        f"{home}   G {h_g} | GA {h_gc} | xG {fmt(h_xg)} | xGA {fmt(h_xga)}",
+        f"{away}   G {a_g} | GA {a_gc} | xG {fmt(a_xg)} | xGA {fmt(a_xga)}",
+        f"Possession {fmt(h_poss)}% vs {fmt(a_poss)}%",
+        f"Shots {fmt(h_shots_for)}/{fmt(h_shots_against)} vs "
+        f"{fmt(a_shots_for)}/{fmt(a_shots_against)} | "
+        f"SoT {fmt(h_sot_for)}/{fmt(h_sot_against)} vs "
+        f"{fmt(a_sot_for)}/{fmt(a_sot_against)}",
+        f"Corners {fmt(h_corners_for)}/{fmt(h_corners_against)} vs "
+        f"{fmt(a_corners_for)}/{fmt(a_corners_against)} | "
+        f"BigCh {fmt(h_bc_for)}/{fmt(h_bc_against)} vs "
+        f"{fmt(a_bc_for)}/{fmt(a_bc_against)}",
+        f"Cards {fmt(h_cards)} vs {fmt(a_cards)} | "
+        f"Fouls {fmt(h_fouls)} vs {fmt(a_fouls)} | "
+        f"GP {fmt(h_gp)} vs {fmt(a_gp)}",
+        "",
+    ]
+
+    if risks:
+        lines.append(f"⚠️ *Risk factors ({len(risks)})*")
+        lines.extend(f"• {r}" for r in risks)
+        lines.append("")
+
+    lines.append(f"🔗 {m_url}")
+
+    return "\n".join(lines)
+
+
+# -------------------------------------------------
+# TEAM TOTAL GOALS UNDER 1.5 PREDICTION
+# -------------------------------------------------
+# Third, independent prediction: does HOME's own total, or AWAY's own
+# total, come in under 1.5 goals — checked separately per side, using
+# the same expected-own-goals blend as the margin/clean-sheet signals
+# (own attacking rate blended with the opponent's own defensive
+# leakiness). A match can fire for home only, away only, both, or
+# neither. Unlike an under-2.5 line, most teams don't reliably sit
+# under 1.5 on their own — this is a real, fairly strict claim, not a
+# near-freebie — so the buffer targets are correspondingly tight (0.7
+# xG-based, 0.5 goals-only).
+
+U15_XG_BUFFER = 0.8    # xG-based: need expected own goals <= 1.5 - 0.8 = 0.7
+U15_GD_BUFFER = 1.0    # goals-only fallback: <= 1.5 - 1.0 = 0.5
+U15_SCORE_THRESHOLD = 2.0   # corroboration bar (see _under_goals_score)
+
+
+def _under_goals_score(
+    team_sot_for, opp_sot_against,
+    team_bc_for, opp_bc_against,
+    team_xgot_for, team_g,
+):
+    """
+    Corroboration score for "this team scores under 1.5" — wants this
+    team's own shot/chance creation (blended with what the opponent
+    typically concedes) to be modest, not high. Ends with a penalty,
+    not a bonus: a team scoring well above its own shot quality
+    (xGOT) is a live risk of a breakout high-scoring game regardless
+    of what the averages otherwise suggest. All args are None-safe.
+    """
+    score = 0.0
+
+    if team_sot_for is not None and opp_sot_against is not None:
+        expected_sot = (team_sot_for + opp_sot_against) / 2
+        if expected_sot <= 3.5:
+            score += 1
+
+    if team_bc_for is not None and opp_bc_against is not None:
+        expected_bc = (team_bc_for + opp_bc_against) / 2
+        if expected_bc <= 1.2:
+            score += 2
+        elif expected_bc <= 2.0:
+            score += 1
+
+    if team_xgot_for is not None and team_g >= team_xgot_for + 0.8:
+        score -= 1.5
+
+    return score
+
+
+def evaluate_team_under_1_5_signal(home, away, home_data, away_data, m_url):
+    """
+    Returns a Telegram-ready message if HOME's own total goals, AWAY's
+    own total goals, or both, clear the bar for "under 1.5" — or None
+    if neither does.
+    """
+    home = _escape_markdown(home)
+    away = _escape_markdown(away)
+
+    hs = home_data["stats"]
+    as_ = away_data["stats"]
+
+    if (
+        hs.get("matches", 0) < MIN_SAMPLE_MATCHES
+        or as_.get("matches", 0) < MIN_SAMPLE_MATCHES
+    ):
+        return None
+
+    h_g = hs.get("avg_goals", 0)
+    a_g = as_.get("avg_goals", 0)
+
+    h_gc = hs.get("avg_gc", 0)
+    a_gc = as_.get("avg_gc", 0)
+
+    h_xg = hs.get("avg_xg")
+    a_xg = as_.get("avg_xg")
+
+    h_xga = hs.get("avg_xga")
+    a_xga = as_.get("avg_xga")
+
+    h_corners_for = hs.get("avg_corners_for")
+    h_corners_against = hs.get("avg_corners_against")
+    a_corners_for = as_.get("avg_corners_for")
+    a_corners_against = as_.get("avg_corners_against")
+
+    h_bc_for = hs.get("avg_big_chances_for")
+    h_bc_against = hs.get("avg_big_chances_against")
+    a_bc_for = as_.get("avg_big_chances_for")
+    a_bc_against = as_.get("avg_big_chances_against")
+
+    h_cards = hs.get("avg_yellow_cards")
+    a_cards = as_.get("avg_yellow_cards")
+    h_fouls = hs.get("avg_fouls")
+    a_fouls = as_.get("avg_fouls")
+
+    h_gp = hs.get("avg_goals_prevented")
+    a_gp = as_.get("avg_goals_prevented")
+
+    h_shots_for = hs.get("avg_shots_for")
+    h_shots_against = hs.get("avg_shots_against")
+    a_shots_for = as_.get("avg_shots_for")
+    a_shots_against = as_.get("avg_shots_against")
+
+    h_sot_for = hs.get("avg_sot_for")
+    h_sot_against = hs.get("avg_sot_against")
+    a_sot_for = as_.get("avg_sot_for")
+    a_sot_against = as_.get("avg_sot_against")
+
+    h_xgot_for = hs.get("avg_xgot_for")
+    a_xgot_for = as_.get("avg_xgot_for")
+
+    h_poss = hs.get("avg_possession")
+    a_poss = as_.get("avg_possession")
+
+    use_xg = (
+        h_xg is not None and a_xg is not None
+        and h_xga is not None and a_xga is not None
+    )
+
+    if use_xg:
+        expected_home_goals = (h_xg + a_xga) / 2
+        expected_away_goals = (a_xg + h_xga) / 2
+        u15_buffer = U15_XG_BUFFER
+        basis = "xG-based"
+    else:
+        expected_home_goals = (h_g + a_gc) / 2
+        expected_away_goals = (a_g + h_gc) / 2
+        u15_buffer = U15_GD_BUFFER
+        basis = "goals-based, no xG data"
+
+    u15_target = 1.5 - u15_buffer
+
+    home_score = _under_goals_score(
+        h_sot_for, a_sot_against,
+        h_bc_for, a_bc_against,
+        h_xgot_for, h_g,
+    )
+    away_score = _under_goals_score(
+        a_sot_for, h_sot_against,
+        a_bc_for, h_bc_against,
+        a_xgot_for, a_g,
+    )
+
+    home_qualifies = (
+        expected_home_goals <= u15_target
+        and home_score >= U15_SCORE_THRESHOLD
+    )
+    away_qualifies = (
+        expected_away_goals <= u15_target
+        and away_score >= U15_SCORE_THRESHOLD
+    )
+
+    if not home_qualifies and not away_qualifies:
+        return None
+
+    risks = []
+    qualifying_lines = []
+
+    if home_qualifies:
+        qualifying_lines.append(
+            f"• {home} under 2.5 (verified to a stricter under-1.5 "
+            f"threshold, {basis}) — expected ~{expected_home_goals:.2f}, "
+            f"corroboration {home_score:.1f}"
+        )
+        if h_xg is not None and h_g >= h_xg + 0.8:
+            risks.append(
+                f"{home} has been scoring above its xG recently — a "
+                f"breakout high-scoring game is possible"
+            )
+
+    if away_qualifies:
+        qualifying_lines.append(
+            f"• {away} under 2.5 (verified to a stricter under-1.5 "
+            f"threshold, {basis}) — expected ~{expected_away_goals:.2f}, "
+            f"corroboration {away_score:.1f}"
+        )
+        if a_xg is not None and a_g >= a_xg + 0.8:
+            risks.append(
+                f"{away} has been scoring above its xG recently — a "
+                f"breakout high-scoring game is possible"
+            )
+
+    def fmt(v):
+        return "N/A" if v is None else str(v)
+
+    lines = [
+        f"⚽ *{home} vs {away}*",
+        "",
+        "🥅 *Prediction: Team Total Goals Under 2.5*",
+        "(the actual bet — analysis is verified to a stricter Under "
+        "1.5 bar first, for extra safety margin)",
+    ]
+    lines.extend(qualifying_lines)
+    lines.append("")
+    lines.append("📊 *Stats*")
+    lines.append(
+        f"{home}   G {h_g} | GA {h_gc} | xG {fmt(h_xg)} | xGA {fmt(h_xga)}"
+    )
+    lines.append(
+        f"{away}   G {a_g} | GA {a_gc} | xG {fmt(a_xg)} | xGA {fmt(a_xga)}"
+    )
+    lines.append(f"Possession {fmt(h_poss)}% vs {fmt(a_poss)}%")
+    lines.append(
+        f"Shots {fmt(h_shots_for)}/{fmt(h_shots_against)} vs "
+        f"{fmt(a_shots_for)}/{fmt(a_shots_against)} | "
+        f"SoT {fmt(h_sot_for)}/{fmt(h_sot_against)} vs "
+        f"{fmt(a_sot_for)}/{fmt(a_sot_against)}"
+    )
+    lines.append(
+        f"Corners {fmt(h_corners_for)}/{fmt(h_corners_against)} vs "
+        f"{fmt(a_corners_for)}/{fmt(a_corners_against)} | "
+        f"BigCh {fmt(h_bc_for)}/{fmt(h_bc_against)} vs "
+        f"{fmt(a_bc_for)}/{fmt(a_bc_against)}"
+    )
+    lines.append(
+        f"Cards {fmt(h_cards)} vs {fmt(a_cards)} | "
+        f"Fouls {fmt(h_fouls)} vs {fmt(a_fouls)} | "
+        f"GP {fmt(h_gp)} vs {fmt(a_gp)}"
+    )
+    lines.append("")
+
+    if risks:
+        lines.append(f"⚠️ *Risk factors ({len(risks)})*")
+        lines.extend(f"• {r}" for r in risks)
+        lines.append("")
+
+    lines.append(f"🔗 {m_url}")
+
+    return "\n".join(lines)
+
+
+# -------------------------------------------------
+# MATCH TOTAL GOALS UNDER 1.5 PREDICTION
+# -------------------------------------------------
+# Fourth, independent prediction: the classic combined match total
+# (home + away goals together) under 1.5 — distinct from
+# evaluate_team_under_1_5_signal, which checks each side's *own*
+# total separately. Reuses _under_goals_score from that signal for
+# each side and sums them, rather than duplicating the corroboration
+# logic — the combined case is just "both sides' under-1.5 case,
+# applied together".
+
+MATCH_U15_XG_BUFFER = 1.0   # xG-based: need combined expected <= 1.5 - 1.0 = 0.5
+MATCH_U15_GD_BUFFER = 1.3   # goals-only fallback: <= 1.5 - 1.3 = 0.2
+MATCH_U15_SCORE_THRESHOLD = 3.0   # corroboration bar, summed across both sides
+
+
+def evaluate_match_under_1_5_signal(home, away, home_data, away_data, m_url):
+    """
+    Returns a Telegram-ready message if the combined match total
+    (home + away goals) clears the bar for "under 1.5", or None.
+    """
+    home = _escape_markdown(home)
+    away = _escape_markdown(away)
+
+    hs = home_data["stats"]
+    as_ = away_data["stats"]
+
+    if (
+        hs.get("matches", 0) < MIN_SAMPLE_MATCHES
+        or as_.get("matches", 0) < MIN_SAMPLE_MATCHES
+    ):
+        return None
+
+    h_g = hs.get("avg_goals", 0)
+    a_g = as_.get("avg_goals", 0)
+
+    h_gc = hs.get("avg_gc", 0)
+    a_gc = as_.get("avg_gc", 0)
+
+    h_xg = hs.get("avg_xg")
+    a_xg = as_.get("avg_xg")
+
+    h_xga = hs.get("avg_xga")
+    a_xga = as_.get("avg_xga")
+
+    h_corners_for = hs.get("avg_corners_for")
+    h_corners_against = hs.get("avg_corners_against")
+    a_corners_for = as_.get("avg_corners_for")
+    a_corners_against = as_.get("avg_corners_against")
+
+    h_bc_for = hs.get("avg_big_chances_for")
+    h_bc_against = hs.get("avg_big_chances_against")
+    a_bc_for = as_.get("avg_big_chances_for")
+    a_bc_against = as_.get("avg_big_chances_against")
+
+    h_cards = hs.get("avg_yellow_cards")
+    a_cards = as_.get("avg_yellow_cards")
+    h_fouls = hs.get("avg_fouls")
+    a_fouls = as_.get("avg_fouls")
+
+    h_gp = hs.get("avg_goals_prevented")
+    a_gp = as_.get("avg_goals_prevented")
+
+    h_shots_for = hs.get("avg_shots_for")
+    h_shots_against = hs.get("avg_shots_against")
+    a_shots_for = as_.get("avg_shots_for")
+    a_shots_against = as_.get("avg_shots_against")
+
+    h_sot_for = hs.get("avg_sot_for")
+    h_sot_against = hs.get("avg_sot_against")
+    a_sot_for = as_.get("avg_sot_for")
+    a_sot_against = as_.get("avg_sot_against")
+
+    h_xgot_for = hs.get("avg_xgot_for")
+    a_xgot_for = as_.get("avg_xgot_for")
+
+    h_poss = hs.get("avg_possession")
+    a_poss = as_.get("avg_possession")
+
+    use_xg = (
+        h_xg is not None and a_xg is not None
+        and h_xga is not None and a_xga is not None
+    )
+
+    if use_xg:
+        expected_home_goals = (h_xg + a_xga) / 2
+        expected_away_goals = (a_xg + h_xga) / 2
+        u15_buffer = MATCH_U15_XG_BUFFER
+        basis = "xG-based"
+    else:
+        expected_home_goals = (h_g + a_gc) / 2
+        expected_away_goals = (a_g + h_gc) / 2
+        u15_buffer = MATCH_U15_GD_BUFFER
+        basis = "goals-based, no xG data"
+
+    combined_expected_goals = expected_home_goals + expected_away_goals
+    u15_target = 1.5 - u15_buffer
+
+    if combined_expected_goals > u15_target:
+        return None
+
+    combined_score = (
+        _under_goals_score(
+            h_sot_for, a_sot_against,
+            h_bc_for, a_bc_against,
+            h_xgot_for, h_g,
+        )
+        + _under_goals_score(
+            a_sot_for, h_sot_against,
+            a_bc_for, h_bc_against,
+            a_xgot_for, a_g,
+        )
+    )
+
+    if combined_score < MATCH_U15_SCORE_THRESHOLD:
+        return None
+
+    risks = []
+
+    if h_xg is not None and h_g >= h_xg + 0.8:
+        risks.append(
+            f"{home} has been scoring above its xG recently — a "
+            f"breakout high-scoring game is possible"
+        )
+
+    if a_xg is not None and a_g >= a_xg + 0.8:
+        risks.append(
+            f"{away} has been scoring above its xG recently — a "
+            f"breakout high-scoring game is possible"
+        )
+
+    def fmt(v):
+        return "N/A" if v is None else str(v)
+
+    lines = [
+        f"⚽ *{home} vs {away}*",
+        "",
+        f"🥅 *Prediction: Match Total Goals Under 2.5* ({basis})",
+        "(the actual bet — analysis is verified to a stricter Under "
+        "1.5 bar first, for extra safety margin)",
+        f"Expected combined ~{combined_expected_goals:.2f} "
+        f"(home ~{expected_home_goals:.2f}, away ~{expected_away_goals:.2f}) "
+        f"| corroboration score {combined_score:.1f}",
         "",
         "📊 *Stats*",
         f"{home}   G {h_g} | GA {h_gc} | xG {fmt(h_xg)} | xGA {fmt(h_xga)}",
@@ -1382,7 +2204,13 @@ def main():
 
                     continue
 
-                msg = evaluate_home_margin_signal(
+                # Independent predictions per match — each can fire or
+                # not fire on its own (e.g. a predicted 1-0 fires the
+                # home margin signal, the clean sheet signal, AND the
+                # away-under-1.5 signal all at once; a predicted 0-2
+                # fires the away margin signal and the home-under-1.5
+                # signal but not the home clean sheet or margin ones).
+                margin_msg = evaluate_home_margin_signal(
                     home,
                     away,
                     home_data,
@@ -1390,18 +2218,67 @@ def main():
                     m_url
                 )
 
-                if msg:
+                away_margin_msg = evaluate_away_margin_signal(
+                    home,
+                    away,
+                    home_data,
+                    away_data,
+                    m_url
+                )
 
-                    log.info("ALERT:\n" + msg)
+                clean_sheet_msg = evaluate_home_clean_sheet_signal(
+                    home,
+                    away,
+                    home_data,
+                    away_data,
+                    m_url
+                )
 
-                    scraper.send_telegram_message(
-                        msg,
-                        BOT_TOKEN,
-                        CHAT_ID
-                    )
+                under_15_msg = evaluate_team_under_1_5_signal(
+                    home,
+                    away,
+                    home_data,
+                    away_data,
+                    m_url
+                )
 
-                else:
+                match_under_15_msg = evaluate_match_under_1_5_signal(
+                    home,
+                    away,
+                    home_data,
+                    away_data,
+                    m_url
+                )
 
+                # Send whichever of the above fired, each as its own
+                # alert. A loop instead of a repeated if/send block per
+                # predictor, since that was already getting unwieldy at
+                # four and will only grow.
+                fired_signals = [
+                    ("home margin", margin_msg),
+                    ("away margin", away_margin_msg),
+                    ("clean sheet", clean_sheet_msg),
+                    # Bet framed as Under 2.5 — the underlying check is
+                    # still verified to a stricter Under 1.5 bar first
+                    # (see evaluate_team_under_1_5_signal), these labels
+                    # just match what the alert message itself says.
+                    ("team under 2.5", under_15_msg),
+                    ("match under 2.5", match_under_15_msg),
+                ]
+
+                any_fired = False
+
+                for label, sig_msg in fired_signals:
+                    if sig_msg:
+                        any_fired = True
+                        log.info(f"ALERT ({label}):\n" + sig_msg)
+                        scraper.send_telegram_message(
+                            sig_msg,
+                            BOT_TOKEN,
+                            CHAT_ID
+                        )
+
+                if not any_fired:
                     log.info("No signals found.")
 
             except Exception as match_err:
