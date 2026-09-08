@@ -893,10 +893,12 @@ GD_MARGIN_BUFFER = 1.3    # need expected_margin >= 3.3
 # Corroboration score (see _margin_score) required on top of the
 # expected-margin gate above. This exists so the signal isn't just
 # trusting a goals/xG gap that might be riding a couple of clinical
-# finishes — it has to show up in shots, chances, or territory too.
-# Max achievable is ~6 (2 shots-on-target + 2 big chances for + 1 big
-# chances against + 1 corners), minus a possible -1.5 xGOT penalty.
-MARGIN_SCORE_THRESHOLD = 3.0
+# finishes — it has to show up in shots, chances, territory, shot
+# quality, or the opposing keeper's own record too. Max achievable is
+# ~8 (2 shots-on-target + 2 big chances for + 1 big chances against +
+# 1 corners + 1 favourite's own xGOT + 1 underdog's leaky keeper),
+# minus a possible -1.5 xGOT-overperformance penalty.
+MARGIN_SCORE_THRESHOLD = 4.0
 
 
 def _margin_score(
@@ -905,6 +907,7 @@ def _margin_score(
     a_bc_for, h_bc_against,
     h_corners_for, a_corners_against,
     a_xgot_for, a_g,
+    h_xg, h_xgot_for, a_gp,
 ):
     """
     Corroboration score for "home wins by 2+" on top of the expected-
@@ -952,6 +955,18 @@ def _margin_score(
             score += 1
         elif expected_home_corners >= 5.0:
             score += 0.5
+
+    # The favourite's own shot quality running above its raw xG is a
+    # positive signal in its own right — not just "not
+    # overperforming", but genuinely creating better chances than xG
+    # alone credits them for.
+    if h_xgot_for is not None and h_xg is not None and h_xgot_for >= h_xg + 0.3:
+        score += 1
+
+    # A leaky underdog goalkeeper (conceding more than their own shot
+    # quality faced suggests) directly corroborates the margin holding.
+    if a_gp is not None and a_gp <= -0.2:
+        score += 1
 
     if a_xgot_for is not None and a_g >= a_xgot_for + 0.8:
         score -= 1.5
@@ -1086,6 +1101,7 @@ def evaluate_home_margin_signal(home, away, home_data, away_data, m_url):
         a_bc_for, h_bc_against,
         h_corners_for, a_corners_against,
         a_xgot_for, a_g,
+        h_xg, h_xgot_for, a_gp,
     )
 
     if margin_score < MARGIN_SCORE_THRESHOLD:
@@ -1275,6 +1291,7 @@ def evaluate_away_margin_signal(home, away, home_data, away_data, m_url):
         h_bc_for, a_bc_against,
         a_corners_for, h_corners_against,
         h_xgot_for, h_g,
+        a_xg, a_xgot_for, h_gp,
     )
 
     if margin_score < MARGIN_SCORE_THRESHOLD:
@@ -1595,21 +1612,26 @@ def evaluate_home_clean_sheet_signal(home, away, home_data, away_data, m_url):
 
 U15_XG_BUFFER = 0.8    # xG-based: need expected own goals <= 1.5 - 0.8 = 0.7
 U15_GD_BUFFER = 1.0    # goals-only fallback: <= 1.5 - 1.0 = 0.5
-U15_SCORE_THRESHOLD = 2.0   # corroboration bar (see _under_goals_score)
+# Max achievable is ~4 (1 shots-on-target + 2 big chances + 1 opposing
+# keeper outperforming shot quality), minus a possible -1.5 xGOT
+# overperformance penalty.
+U15_SCORE_THRESHOLD = 2.5   # corroboration bar (see _under_goals_score)
 
 
 def _under_goals_score(
     team_sot_for, opp_sot_against,
     team_bc_for, opp_bc_against,
     team_xgot_for, team_g,
+    opp_gp,
 ):
     """
     Corroboration score for "this team scores under 1.5" — wants this
     team's own shot/chance creation (blended with what the opponent
-    typically concedes) to be modest, not high. Ends with a penalty,
-    not a bonus: a team scoring well above its own shot quality
-    (xGOT) is a live risk of a breakout high-scoring game regardless
-    of what the averages otherwise suggest. All args are None-safe.
+    typically concedes) to be modest, not high. All args are
+    None-safe. Ends with a penalty, not a bonus: a team scoring well
+    above its own shot quality (xGOT) is a live risk of a breakout
+    high-scoring game regardless of what the averages otherwise
+    suggest.
     """
     score = 0.0
 
@@ -1624,6 +1646,12 @@ def _under_goals_score(
             score += 2
         elif expected_bc <= 2.0:
             score += 1
+
+    # An opposing goalkeeper who's been outperforming their own shot
+    # quality faced is direct corroboration of this team scoring less
+    # than the raw averages alone suggest.
+    if opp_gp is not None and opp_gp >= 0.2:
+        score += 1
 
     if team_xgot_for is not None and team_g >= team_xgot_for + 0.8:
         score -= 1.5
@@ -1717,11 +1745,13 @@ def evaluate_team_under_1_5_signal(home, away, home_data, away_data, m_url):
         h_sot_for, a_sot_against,
         h_bc_for, a_bc_against,
         h_xgot_for, h_g,
+        a_gp,
     )
     away_score = _under_goals_score(
         a_sot_for, h_sot_against,
         a_bc_for, h_bc_against,
         a_xgot_for, a_g,
+        h_gp,
     )
 
     home_qualifies = (
@@ -1825,7 +1855,10 @@ def evaluate_team_under_1_5_signal(home, away, home_data, away_data, m_url):
 
 MATCH_U15_XG_BUFFER = 1.0   # xG-based: need combined expected <= 1.5 - 1.0 = 0.5
 MATCH_U15_GD_BUFFER = 1.3   # goals-only fallback: <= 1.5 - 1.3 = 0.2
-MATCH_U15_SCORE_THRESHOLD = 3.0   # corroboration bar, summed across both sides
+# Summed across both sides' _under_goals_score (max ~4 each, so ~8
+# combined) — kept at the same ~50% proportional bar as the per-team
+# signal's threshold.
+MATCH_U15_SCORE_THRESHOLD = 4.0
 
 
 def evaluate_match_under_1_5_signal(home, away, home_data, away_data, m_url):
@@ -1918,11 +1951,13 @@ def evaluate_match_under_1_5_signal(home, away, home_data, away_data, m_url):
             h_sot_for, a_sot_against,
             h_bc_for, a_bc_against,
             h_xgot_for, h_g,
+            a_gp,
         )
         + _under_goals_score(
             a_sot_for, h_sot_against,
             a_bc_for, h_bc_against,
             a_xgot_for, a_g,
+            h_gp,
         )
     )
 
