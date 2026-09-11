@@ -51,6 +51,15 @@ NAV_TIMEOUT_MS = int(os.getenv("SCRAPER_NAV_TIMEOUT_MS", "45000"))
 # per team, invisibly.
 DISCOVER_TIME_BUDGET_SEC = int(os.getenv("SCRAPER_DISCOVER_BUDGET_SEC", "60"))
 
+# Timeout for get_match_data's in-page Stats-tab click + the wait for
+# the stats table to render. Was a hardcoded 5s click + 15s wait (20s
+# worst case) with zero logging — invisible in the log as a multi-
+# minute gap once it happened on several matches in a row. Now timed
+# (see get_match_data) and tunable; small/regional-league matches
+# often have no Stats tab at all, so hitting this timeout is expected
+# to happen sometimes, not necessarily a bug.
+STATS_TAB_TIMEOUT_MS = int(os.getenv("SCRAPER_STATS_TAB_TIMEOUT_MS", "8000"))
+
 # Title substrings seen on common bot-mitigation interstitials
 # (Cloudflare, DataDome, generic "checking your browser" pages). If a
 # page we expect to be a normal Flashscore page shows one of these
@@ -684,14 +693,29 @@ class FlashscoreGoalsScraper:
         }
         match_data.update(self._empty_stat_result())
 
+        # This click+wait pair was the last unlogged step in the whole
+        # pipeline — every navigation goes through _timed_goto now, but
+        # this in-page tab switch doesn't navigate, so a slow/failed
+        # click here was invisible in the log: a run could show a
+        # multi-minute gap between two goto lines with nothing to
+        # explain it. Timed explicitly so that gap has a cause now.
+        t0 = time.time()
         try:
             self.page.locator("a[href*='summary/stats']").first.click(
-                timeout=5000
+                timeout=STATS_TAB_TIMEOUT_MS
             )
-            self._wait_ready("[data-testid='wcl-statistics']")
+            self._wait_ready(
+                "[data-testid='wcl-statistics']", timeout=STATS_TAB_TIMEOUT_MS
+            )
             match_data.update(self._extract_stats_from_current_page())
-        except Exception:
-            pass
+            log.info(
+                f"stats tab for {match_url} took {time.time()-t0:.1f}s"
+            )
+        except Exception as e:
+            log.warning(
+                f"stats tab for {match_url} failed after "
+                f"{time.time()-t0:.1f}s: {e}"
+            )
 
         return match_data
 
@@ -903,6 +927,13 @@ class FlashscoreGoalsScraper:
         return round(total / counted, 2)
 
     def analyze_team(self, team_url):
+        # Logged so total per-team time is visible even though the two
+        # teams' analyze_team calls run concurrently in separate threads
+        # and their goto/discover_matches lines interleave in the log —
+        # this line bounds where each team's slice actually started and
+        # ended.
+        t0 = time.time()
+
         if not self.open_team_results(team_url):
             return None
 
@@ -914,6 +945,12 @@ class FlashscoreGoalsScraper:
 
             if match_data:
                 results.append(match_data)
+
+        log.info(
+            f"analyze_team({self.team_label or self.team_slug!r}): "
+            f"{len(results)}/{len(matches)} matches fetched in "
+            f"{time.time()-t0:.1f}s total"
+        )
 
         stats = self.calculate_team_goals(results)
         avg_gc = self.calculate_team_goals_conceded(results)
