@@ -135,6 +135,36 @@ def _log_resource_usage(label):
         log.debug(f"resource logging failed: {e}")
 
 
+# ---------------- REQUEST BLOCKING ----------------
+# Resource types this scraper never needs — it only ever reads text/DOM
+# state (team names, scores, stat table values), never anything visual.
+# Blocking these cuts page weight and JS/rendering cost substantially,
+# which matters a lot with 3 browser instances (fixtures walker + home
+# worker + away worker) potentially rendering concurrently — a run
+# showed individual 8s-budgeted operations occasionally taking 150-1200+
+# seconds, well past what a slow-but-working page load explains, more
+# consistent with host CPU contention from heavy pages (ads, trackers,
+# video widgets) than with anything else.
+#
+# Deliberately NOT blocking stylesheets or scripts: _wait_ready's
+# state="visible" checks depend on CSS layout, and Flashscore's own
+# content (team names, live stats) is client-side rendered via JS, so
+# either would break the actual scraping, not just slim it down.
+BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
+
+
+def _block_heavy_resources(route):
+    try:
+        if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
+            route.abort()
+        else:
+            route.continue_()
+    except Exception:
+        # A route that's already been handled/the page navigated away
+        # mid-request raises here — never let that break the load.
+        pass
+
+
 # ---------------- JOB STATUS TELEGRAM ----------------
 def send_job_status(message, bot_token, chat_id):
     try:
@@ -169,6 +199,7 @@ class FlashscoreGoalsScraper:
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
             ),
         )
+        self.context.route("**/*", _block_heavy_resources)
         self.page = self.context.new_page()
 
     def _launch_browser(self):
