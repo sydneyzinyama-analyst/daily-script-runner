@@ -3,6 +3,7 @@ import sys
 import argparse
 import logging
 import threading
+import queue
 import traceback
 from playwright.sync_api import sync_playwright
 from urllib.parse import urlparse
@@ -60,6 +61,14 @@ DISCOVER_TIME_BUDGET_SEC = int(os.getenv("SCRAPER_DISCOVER_BUDGET_SEC", "60"))
 # to happen sometimes, not necessarily a bug.
 STATS_TAB_TIMEOUT_MS = int(os.getenv("SCRAPER_STATS_TAB_TIMEOUT_MS", "8000"))
 
+# How many analyze_team() calls a single browser process handles
+# before FlashscoreGoalsScraper.maybe_recycle_browser() closes and
+# relaunches it. See maybe_recycle_browser's docstring for the
+# investigation that motivated this — was previously implicitly "1"
+# (a fresh browser process per team, per match), which is what led
+# to the resource exhaustion this whole mechanism replaces.
+BROWSER_RECYCLE_EVERY = int(os.getenv("SCRAPER_BROWSER_RECYCLE_EVERY", "40"))
+
 # Title substrings seen on common bot-mitigation interstitials
 # (Cloudflare, DataDome, generic "checking your browser" pages). If a
 # page we expect to be a normal Flashscore page shows one of these
@@ -75,6 +84,57 @@ BOT_CHALLENGE_MARKERS = (
 )
 
 
+# ---------------- RESOURCE DIAGNOSTICS ----------------
+def _log_resource_usage(label):
+    # Diagnostic-only, deliberately dependency-free: reads straight
+    # from /proc rather than pulling in psutil (not in requirements.txt,
+    # and it turned out to be broken in this environment anyway) —
+    # /proc is standard on every Linux runner this script actually runs
+    # on. Added to confirm/rule out a suspected leak: each match spins
+    # up two brand-new Chromium browser processes (home/away threads)
+    # and closes them after, and a run that starts fast (~1min/match)
+    # then falls off a cliff into multi-minute stalls partway through
+    # looks a lot like those processes/memory not being fully reclaimed
+    # and the host progressively starving under the accumulated load.
+    # Fails soft — never let a diagnostic break the actual scrape.
+    try:
+        chrome_procs = 0
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/comm") as f:
+                    comm = f.read().strip()
+                if "chrom" in comm.lower():
+                    chrome_procs += 1
+            except Exception:
+                continue
+
+        mem_available_kb = None
+        mem_total_kb = None
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    mem_available_kb = int(line.split()[1])
+                elif line.startswith("MemTotal:"):
+                    mem_total_kb = int(line.split()[1])
+
+        if mem_available_kb is not None and mem_total_kb is not None:
+            mem_str = (
+                f"{mem_available_kb / 1024:.0f}MB free / "
+                f"{mem_total_kb / 1024:.0f}MB total"
+            )
+        else:
+            mem_str = "unknown"
+
+        log.info(
+            f"[resources @ {label}] chrome-family processes="
+            f"{chrome_procs}, memory={mem_str}"
+        )
+    except Exception as e:
+        log.debug(f"resource logging failed: {e}")
+
+
 # ---------------- JOB STATUS TELEGRAM ----------------
 def send_job_status(message, bot_token, chat_id):
     try:
@@ -88,9 +148,22 @@ def send_job_status(message, bot_token, chat_id):
 # ---------------- SCRAPER CLASS ----------------
 class FlashscoreGoalsScraper:
     def __init__(self, headless=True):
+        self.headless = headless
         self.playwright = sync_playwright().start()
+        self.browser = None
+        self.context = None
+        self.page = None
+        self._session_count = 0
+        self._launch_browser()
+        self.team_url = ""
+        self.team_slug = ""
+        self.team_label = ""
+
+    def _launch_browser(self):
+        # Factored out of __init__ so maybe_recycle_browser (below) can
+        # relaunch with identical settings instead of duplicating them.
         self.browser = self.playwright.chromium.launch(
-            headless=headless,
+            headless=self.headless,
             # --no-sandbox / --disable-dev-shm-usage are required in most
             # scheduler contexts: cron/systemd jobs often run as root (where
             # Chromium's sandbox refuses to start without --no-sandbox) or
@@ -111,9 +184,44 @@ class FlashscoreGoalsScraper:
             ),
         )
         self.page = self.context.new_page()
-        self.team_url = ""
-        self.team_slug = ""
-        self.team_label = ""
+        self._session_count = 0
+
+    def maybe_recycle_browser(self):
+        # Was: a brand-new FlashscoreGoalsScraper (full Playwright +
+        # Chromium launch) built and torn down for every single team,
+        # every single match — up to ~200 browser launches in a
+        # 100-match batch. A logged run showed this snowballing partway
+        # through a batch into multi-hundred/multi-thousand-second
+        # stalls on operations budgeted at 8s, with unrelated matches
+        # stalling for near-identical durations simultaneously — the
+        # signature of host-level resource starvation (process/memory
+        # accumulation), not per-page network issues. The fix: reuse
+        # one browser across many teams' analyze_team() calls (call
+        # this between them) instead of relaunching per team, with a
+        # periodic full recycle as a safety net against any slower
+        # leak inside a single very-long-lived Chromium process.
+        self._session_count += 1
+
+        if self._session_count < BROWSER_RECYCLE_EVERY:
+            return
+
+        log.info(
+            f"Recycling browser after {self._session_count} team "
+            f"analyses (SCRAPER_BROWSER_RECYCLE_EVERY="
+            f"{BROWSER_RECYCLE_EVERY})"
+        )
+
+        try:
+            self.context.close()
+        except Exception as e:
+            log.warning(f"Error closing context during recycle: {e}")
+
+        try:
+            self.browser.close()
+        except Exception as e:
+            log.warning(f"Error closing browser during recycle: {e}")
+
+        self._launch_browser()
 
     # ---------------- TELEGRAM ----------------
     def send_telegram_message(self, message, bot_token, chat_id):
@@ -377,10 +485,43 @@ class FlashscoreGoalsScraper:
         except Exception as e:
             log.warning(f"expand_hidden_matches failed: {e}")
 
-    def discover_matches(self, target_count, max_tries=250):
+    def _is_match_upcoming(self, link):
+        """
+        True if `link` (an <a href*='/match/'> Locator on the fixtures
+        page) belongs to a match that hasn't started yet. Flashscore
+        tags each match row's class with 'event__match--scheduled' for
+        not-yet-started, 'event__match--live' for in progress, and
+        neither for already-finished (row text starts "Finished", full
+        score already filled in) — confirmed against the live site.
+
+        Only meaningful on the fixtures/upcoming page. discover_matches
+        is also used against a team's *results* page to pull their past
+        6 matches for stats (see analyze_team) — those rows are
+        supposed to be finished, so this check is opt-in via
+        only_upcoming rather than applied unconditionally.
+
+        Fails open (returns True, i.e. don't skip) on any lookup
+        failure or unrecognized row structure — the existing behavior
+        of analyzing a match we shouldn't have is far less bad than
+        silently dropping matches because a markup detail shifted.
+        """
+        try:
+            row = link.locator(
+                "xpath=ancestor::div[contains(@class,'event__match')][1]"
+            )
+            if row.count() == 0:
+                return True
+
+            cls = row.first.get_attribute("class") or ""
+            return "event__match--scheduled" in cls
+        except Exception:
+            return True
+
+    def discover_matches(self, target_count, max_tries=250, only_upcoming=False):
         matches = []
         seen = set()
         tries = 0
+        skipped_not_upcoming = 0
         t0 = time.time()
 
         while len(matches) < target_count and tries < max_tries:
@@ -404,9 +545,21 @@ class FlashscoreGoalsScraper:
                 href = href.split("/tv")[0].split("#")[0]
                 full_url = self._abs_url(href)
 
-                if full_url not in seen and "?mid=" in full_url:
-                    matches.append(full_url)
+                if full_url in seen or "?mid=" not in full_url:
+                    continue
+
+                if only_upcoming and not self._is_match_upcoming(link):
+                    # Already live or finished — no point spending a
+                    # full analyze_team() pass predicting a match that
+                    # has already happened. Still mark as seen so we
+                    # don't keep re-checking the same row every retry
+                    # pass, but don't count it toward target_count.
                     seen.add(full_url)
+                    skipped_not_upcoming += 1
+                    continue
+
+                matches.append(full_url)
+                seen.add(full_url)
 
                 if len(matches) >= target_count:
                     break
@@ -426,6 +579,11 @@ class FlashscoreGoalsScraper:
             f"discover_matches for {self.team_label or self.team_slug!r}: "
             f"found {len(matches)}/{target_count} in {tries} tries, "
             f"{time.time()-t0:.1f}s"
+            + (
+                f", skipped {skipped_not_upcoming} already-started/finished"
+                if only_upcoming
+                else ""
+            )
         )
         return matches
 
@@ -2235,20 +2393,52 @@ def main():
     log.info("Starting Flashscore alert script...")
     log.info(f"Batch start={START}, limit={LIMIT}")
 
-    # Declared before the try block so `finally` can safely check it even
-    # if construction itself fails (see below).
+    # Declared before the try block so `finally` can safely check them
+    # even if construction itself fails (see below).
     #
     # NOTE on the per-match parallel fetch below: Playwright's sync API
     # only supports one sync_playwright() instance per OS thread — a
     # second one in the *same* thread throws "using Playwright Sync API
     # inside the asyncio loop", even with no actual threading involved
-    # yet. So `home_scraper`/`away_scraper` can't be created once up
-    # here alongside `scraper` and just reused — each one has to be
-    # constructed *inside* its own worker thread, per match, and closed
-    # there too. Confirmed this is required, not just tidy, by hitting
-    # that exact error creating a second instance in one thread before
-    # ever starting a thread.
+    # yet. So `home`/`away` team analysis each need their own dedicated
+    # OS thread. Previously each of those threads built and tore down a
+    # brand-new FlashscoreGoalsScraper (a full Playwright + Chromium
+    # launch) *per match* — up to ~200 browser launches in a 100-match
+    # batch. A logged run showed that snowballing partway through a
+    # batch into multi-hundred/multi-thousand-second stalls on
+    # operations budgeted at 8s, with unrelated matches stalling for
+    # near-identical durations simultaneously — host-level resource
+    # starvation from the accumulated launches, not per-page network
+    # issues. Fix: one persistent worker thread per side, each owning
+    # ONE scraper (see maybe_recycle_browser) for the whole batch,
+    # pulling team URLs off a queue instead of being spawned fresh
+    # every match.
     scraper = None
+    home_thread = None
+    away_thread = None
+    home_queue_in = queue.Queue()
+    home_queue_out = queue.Queue()
+    away_queue_in = queue.Queue()
+    away_queue_out = queue.Queue()
+
+    def _team_worker(queue_in, queue_out, label):
+        worker_scraper = None
+        try:
+            worker_scraper = FlashscoreGoalsScraper(headless=HEADLESS)
+            while True:
+                team_url = queue_in.get()
+                if team_url is None:
+                    break
+                try:
+                    worker_scraper.maybe_recycle_browser()
+                    data = worker_scraper.analyze_team(team_url)
+                    queue_out.put((data, None))
+                except Exception as e:
+                    queue_out.put((None, e))
+        finally:
+            if worker_scraper is not None:
+                worker_scraper.close()
+            _log_resource_usage(f"{label} worker exiting")
 
     try:
         # Building the scraper (Playwright start + browser launch) is now
@@ -2258,6 +2448,25 @@ def main():
         # crashed the whole process with no "❌ Job FAILED" alert and no
         # cleanup — you'd only ever see the "🚀 Job STARTED" message.
         scraper = FlashscoreGoalsScraper(headless=HEADLESS)
+
+        # Started here (before fixtures discovery, which itself can take
+        # up to a minute — see DISCOVER_TIME_BUDGET_SEC) so their own
+        # browser launches overlap with that instead of adding to the
+        # critical path.
+        home_thread = threading.Thread(
+            target=_team_worker,
+            args=(home_queue_in, home_queue_out, "home"),
+            daemon=True,
+        )
+        away_thread = threading.Thread(
+            target=_team_worker,
+            args=(away_queue_in, away_queue_out, "away"),
+            daemon=True,
+        )
+        home_thread.start()
+        away_thread.start()
+
+        _log_resource_usage("job start, after fixtures browser launch")
 
         log.info(f"Opening fixtures page: {FIXTURES_URL}")
 
@@ -2272,7 +2481,14 @@ def main():
         scraper.accept_cookies()
 
         matches = scraper.discover_matches(
-            TARGET_COUNT
+            TARGET_COUNT,
+            # Only fixtures that haven't kicked off yet — no point
+            # spending a full analysis on a match that's already live
+            # or finished (see _is_match_upcoming). Left False (default)
+            # everywhere else discover_matches is called — e.g. inside
+            # analyze_team, pulling a team's past 6 results, which are
+            # *supposed* to already be finished.
+            only_upcoming=True
         )
 
         log.info(f"Found {len(matches)} upcoming matches total")
@@ -2328,55 +2544,22 @@ def main():
                 home = fixture["home_name"]
                 away = fixture["away_name"]
 
-                # Run both teams' 6-match analysis concurrently. Each
-                # thread creates, uses, and closes its own scraper
-                # instance — Playwright's sync API only supports one
-                # sync_playwright() per OS thread, so these can't be
-                # created ahead of time and just reused across matches
-                # the way `scraper` (fixtures walker) is.
-                home_data = None
-                away_data = None
-                home_error = None
-                away_error = None
+                # Hand both teams off to their persistent worker threads
+                # (started once, before the match loop — see the note
+                # above `scraper = FlashscoreGoalsScraper(...)`) and
+                # block until both results are back. Still concurrent
+                # per match, just without relaunching a browser to do it.
+                home_queue_in.put(fixture["home_url"])
+                away_queue_in.put(fixture["away_url"])
 
-                def _run_home():
-                    nonlocal home_data, home_error
-                    home_scraper = None
-                    try:
-                        home_scraper = FlashscoreGoalsScraper(
-                            headless=HEADLESS
-                        )
-                        home_data = home_scraper.analyze_team(
-                            fixture["home_url"]
-                        )
-                    except Exception as e:
-                        home_error = e
-                    finally:
-                        if home_scraper is not None:
-                            home_scraper.close()
+                home_data, home_error = home_queue_out.get()
+                away_data, away_error = away_queue_out.get()
 
-                def _run_away():
-                    nonlocal away_data, away_error
-                    away_scraper = None
-                    try:
-                        away_scraper = FlashscoreGoalsScraper(
-                            headless=HEADLESS
-                        )
-                        away_data = away_scraper.analyze_team(
-                            fixture["away_url"]
-                        )
-                    except Exception as e:
-                        away_error = e
-                    finally:
-                        if away_scraper is not None:
-                            away_scraper.close()
-
-                t_home = threading.Thread(target=_run_home)
-                t_away = threading.Thread(target=_run_away)
-                t_home.start()
-                t_away.start()
-                t_home.join()
-                t_away.join()
+                # Logged after every match — this is the line that shows
+                # whether chrome-family process count / free memory is
+                # holding steady across the batch instead of climbing
+                # (see _log_resource_usage docstring).
+                _log_resource_usage(f"after match {idx}")
 
                 if home_error:
                     log.error(f"Home team analysis failed: {home_error}")
@@ -2506,6 +2689,22 @@ def main():
 
         if scraper is not None:
             scraper.close()
+
+        # Signal both persistent team-analysis workers to stop (they
+        # each close their own scraper/browser in _team_worker's own
+        # `finally` block on seeing this sentinel) and wait for that to
+        # happen before the process exits.
+        try:
+            if home_thread is not None and home_thread.is_alive():
+                home_queue_in.put(None)
+            if away_thread is not None and away_thread.is_alive():
+                away_queue_in.put(None)
+            if home_thread is not None:
+                home_thread.join(timeout=30)
+            if away_thread is not None:
+                away_thread.join(timeout=30)
+        except Exception as e:
+            log.warning(f"Error shutting down team worker threads: {e}")
 
         log.info("Script finished.")
 
