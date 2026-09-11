@@ -159,6 +159,18 @@ class FlashscoreGoalsScraper:
         self.team_slug = ""
         self.team_label = ""
 
+    def _new_context(self):
+        # Factored out so both _launch_browser and new_session (below)
+        # create contexts with identical settings.
+        self.context = self.browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+            ),
+        )
+        self.page = self.context.new_page()
+
     def _launch_browser(self):
         # Factored out of __init__ so maybe_recycle_browser (below) can
         # relaunch with identical settings instead of duplicating them.
@@ -176,15 +188,34 @@ class FlashscoreGoalsScraper:
                 "--disable-gpu",
             ],
         )
-        self.context = self.browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
-            ),
-        )
-        self.page = self.context.new_page()
+        self._new_context()
         self._session_count = 0
+
+    def new_session(self):
+        """
+        Closes the current context and opens a fresh one on the SAME
+        browser process — new cookies, localStorage, sessionStorage,
+        no carryover from whatever the previous context did. Call this
+        between logical units of work (e.g. once per team, before
+        analyze_team) that need isolation from each other.
+
+        This is the cheap half of what a full relaunch used to buy you
+        for free: a brand-new FlashscoreGoalsScraper per match gave
+        every team a completely clean browser AND cost a full Chromium
+        process launch/teardown to do it — which turned out to be the
+        cause of a serious resource-exhaustion regression (see
+        maybe_recycle_browser). Closing/reopening a context instead of
+        the whole process gives the same session isolation for a small
+        fraction of the cost, so it's safe to call every match instead
+        of only every BROWSER_RECYCLE_EVERY like the full recycle.
+        """
+        try:
+            if self.context is not None:
+                self.context.close()
+        except Exception as e:
+            log.warning(f"Error closing context for new session: {e}")
+
+        self._new_context()
 
     def maybe_recycle_browser(self):
         # Was: a brand-new FlashscoreGoalsScraper (full Playwright +
@@ -2430,7 +2461,13 @@ def main():
                 if team_url is None:
                     break
                 try:
+                    # Periodic full relaunch (rare — every
+                    # BROWSER_RECYCLE_EVERY calls, safety net against a
+                    # process-level leak) then a fresh context every
+                    # single match (cheap — real isolation, no cookie/
+                    # session carryover between teams).
                     worker_scraper.maybe_recycle_browser()
+                    worker_scraper.new_session()
                     data = worker_scraper.analyze_team(team_url)
                     queue_out.put((data, None))
                 except Exception as e:
