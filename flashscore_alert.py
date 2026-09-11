@@ -30,6 +30,42 @@ logging.basicConfig(
 log = logging.getLogger("flashscore")
 
 
+# ---------------- DIAGNOSTIC / FAIL-FAST TUNABLES ----------------
+# Added while chasing a "this got much slower all of a sudden in Actions"
+# regression: navigations were pinned at a flat 90s timeout with zero
+# timing/visibility into where time was actually going, so a single
+# slow/challenged page load was indistinguishable from a healthy one
+# until it either finished or ate a full 90s. These make that visible
+# and cap the worst case instead of silently absorbing it.
+#
+# Lower this to fail faster once you've confirmed pages are genuinely
+# hanging rather than just slow; raise it back if you start seeing
+# false-negative timeouts on a healthy-but-slow connection.
+NAV_TIMEOUT_MS = int(os.getenv("SCRAPER_NAV_TIMEOUT_MS", "45000"))
+
+# Hard ceiling on how long discover_matches (and the expand_hidden_matches
+# loop it calls) is allowed to spend scrolling/expanding for one team,
+# on top of the existing max_tries cap. Without this, a page whose
+# "display matches" markup no longer matches our selector can spin
+# through all 250 tries at ~2s of sleep each — worst case ~8+ minutes —
+# per team, invisibly.
+DISCOVER_TIME_BUDGET_SEC = int(os.getenv("SCRAPER_DISCOVER_BUDGET_SEC", "60"))
+
+# Title substrings seen on common bot-mitigation interstitials
+# (Cloudflare, DataDome, generic "checking your browser" pages). If a
+# page we expect to be a normal Flashscore page shows one of these
+# instead, that's a strong signal we're being challenged/slow-walked
+# rather than just experiencing normal latency.
+BOT_CHALLENGE_MARKERS = (
+    "just a moment",
+    "checking your browser",
+    "attention required",
+    "verify you are human",
+    "access denied",
+    "are you a robot",
+)
+
+
 # ---------------- JOB STATUS TELEGRAM ----------------
 def send_job_status(message, bot_token, chat_id):
     try:
@@ -155,6 +191,42 @@ class FlashscoreGoalsScraper:
         except Exception:
             pass
 
+    def _timed_goto(self, url, **kwargs):
+        # Every navigation in this class routes through here now so a
+        # slow run's log shows exactly which page loads are the ones
+        # ballooning, instead of the whole discover/analyze pipeline
+        # being one opaque gap between log lines. kwargs are passed
+        # straight through to page.goto (wait_until, timeout, ...).
+        t0 = time.time()
+        try:
+            self.page.goto(url, **kwargs)
+            elapsed = time.time() - t0
+            log.info(f"goto {url} took {elapsed:.1f}s")
+        except Exception as e:
+            elapsed = time.time() - t0
+            log.warning(f"goto {url} failed after {elapsed:.1f}s: {e}")
+            raise
+
+    def _check_bot_challenge(self, context_label=""):
+        # Cheap check for a bot-mitigation interstitial: if we're
+        # sitting on a "Just a moment..."-style page instead of the
+        # real Flashscore page, every downstream selector wait will
+        # silently time out and *look* like ordinary slowness. This
+        # makes that distinguishable in the log instead of guessing.
+        try:
+            title = (self.page.title() or "").strip()
+        except Exception:
+            return False
+
+        if any(marker in title.lower() for marker in BOT_CHALLENGE_MARKERS):
+            log.warning(
+                f"POSSIBLE BOT CHALLENGE{' (' + context_label + ')' if context_label else ''}: "
+                f"page title={title!r} url={self.page.url!r}"
+            )
+            return True
+
+        return False
+
     def _parse_stat_value(self, text):
         # Stats on the overall/stats page come in a few shapes:
         #   "19"                -> plain count
@@ -229,8 +301,9 @@ class FlashscoreGoalsScraper:
         url = team_url.rstrip("/") + "/results/"
         log.info(f"Opening results page: {url}")
         try:
-            self.page.goto(url, wait_until="load", timeout=90000)
+            self._timed_goto(url, wait_until="load", timeout=NAV_TIMEOUT_MS)
             self._wait_ready("h1", timeout=10000)
+            self._check_bot_challenge(f"results page for {self.team_slug}")
             self.accept_cookies()
             page_name = self.get_team_name_from_page()
             if page_name:
@@ -241,8 +314,34 @@ class FlashscoreGoalsScraper:
             return False
 
     def expand_hidden_matches(self):
+        # Bounded by both an iteration count and a wall-clock budget
+        # (whichever hits first) so a "display matches" button that
+        # keeps reappearing — e.g. after a markup change — can't turn
+        # this into an unbounded loop hiding inside discover_matches'
+        # own retry budget.
+        t0 = time.time()
+        iterations = 0
+        max_iterations = 40
+
         try:
             while True:
+                if time.time() - t0 > DISCOVER_TIME_BUDGET_SEC:
+                    log.warning(
+                        f"expand_hidden_matches hit its "
+                        f"{DISCOVER_TIME_BUDGET_SEC}s time budget after "
+                        f"{iterations} iterations, giving up for this pass"
+                    )
+                    break
+
+                if iterations >= max_iterations:
+                    log.warning(
+                        f"expand_hidden_matches hit max_iterations="
+                        f"{max_iterations}, giving up for this pass"
+                    )
+                    break
+
+                iterations += 1
+
                 btns = self.page.locator("text=/display matches/i")
                 count = btns.count()
 
@@ -273,8 +372,18 @@ class FlashscoreGoalsScraper:
         matches = []
         seen = set()
         tries = 0
+        t0 = time.time()
 
         while len(matches) < target_count and tries < max_tries:
+            if time.time() - t0 > DISCOVER_TIME_BUDGET_SEC:
+                log.warning(
+                    f"discover_matches for {self.team_label or self.team_slug!r} "
+                    f"hit its {DISCOVER_TIME_BUDGET_SEC}s time budget after "
+                    f"{tries} tries with {len(matches)}/{target_count} found "
+                    f"— stopping early instead of grinding to max_tries"
+                )
+                break
+
             self.expand_hidden_matches()
 
             links = self.page.locator("a[href*='/match/'][href*='?mid=']").all()
@@ -304,11 +413,18 @@ class FlashscoreGoalsScraper:
             time.sleep(2)
             tries += 1
 
+        log.info(
+            f"discover_matches for {self.team_label or self.team_slug!r}: "
+            f"found {len(matches)}/{target_count} in {tries} tries, "
+            f"{time.time()-t0:.1f}s"
+        )
         return matches
 
     def get_match_teams_and_links(self, match_url):
         try:
-            self.page.goto(match_url, wait_until="domcontentloaded", timeout=90000)
+            self._timed_goto(
+                match_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS
+            )
             self._wait_ready(
                 ".duelParticipant__home .participant__participantName a"
             )
@@ -442,10 +558,10 @@ class FlashscoreGoalsScraper:
             return result
 
         try:
-            self.page.goto(
+            self._timed_goto(
                 stats_url,
                 wait_until="domcontentloaded",
-                timeout=90000
+                timeout=NAV_TIMEOUT_MS
             )
             self._wait_ready("[data-testid='wcl-statistics']")
 
@@ -457,10 +573,10 @@ class FlashscoreGoalsScraper:
 
     def get_match_goals(self, match_url):
         try:
-            self.page.goto(
+            self._timed_goto(
                 match_url,
                 wait_until="domcontentloaded",
-                timeout=90000
+                timeout=NAV_TIMEOUT_MS
             )
             self._wait_ready(
                 ".duelParticipant__home .participant__participantName a"
@@ -520,10 +636,10 @@ class FlashscoreGoalsScraper:
         get_match_stats on a match with no stats page.
         """
         try:
-            self.page.goto(
+            self._timed_goto(
                 match_url,
                 wait_until="domcontentloaded",
-                timeout=90000
+                timeout=NAV_TIMEOUT_MS
             )
             self._wait_ready(
                 ".duelParticipant__home .participant__participantName a"
@@ -2108,13 +2224,14 @@ def main():
 
         log.info(f"Opening fixtures page: {FIXTURES_URL}")
 
-        scraper.page.goto(
+        scraper._timed_goto(
             FIXTURES_URL,
             wait_until="load",
-            timeout=80000
+            timeout=NAV_TIMEOUT_MS
         )
 
         scraper._wait_ready("a[href*='/match/']")
+        scraper._check_bot_challenge("fixtures page")
         scraper.accept_cookies()
 
         matches = scraper.discover_matches(
