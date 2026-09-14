@@ -192,19 +192,27 @@ class SixtyFiveScoresScraper:
         return None
 
     # ---------------- DISCOVERY ----------------
-    def discover_matches(self, target_count, date_str=None, only_upcoming=False):
+    def discover_matches(
+        self, target_count, date_str=None, only_upcoming=False, only_finished=False
+    ):
         """
         Returns up to `target_count` match dicts for `date_str`
         (today, server-local, if not given, as DD/MM/YYYY — what the
         API expects): each
-        {id, home_id, home_name, away_id, away_name, tournament}.
+        {id, home_id, home_name, away_id, away_name, tournament,
+        home_goals, away_goals} (the last two are None unless the
+        match has already finished).
 
         A single games/allscores call already returns every match
         across every competition for the given date (163 on the day
         this was tested) — no per-tournament pagination needed, unlike
         the Sofascore version. When only_upcoming is True, skips
         anything not in statusGroup 2 (scheduled/not started) — 4 is
-        finished, confirmed by direct inspection.
+        finished, confirmed by direct inspection. only_finished is the
+        mirror of that — used for backtesting a past date, where every
+        match is expected to already be finished (statusGroup 4);
+        only_upcoming and only_finished are mutually exclusive, not
+        enforced here since callers only ever pass one.
         """
         if date_str is None:
             date_str = time.strftime("%d/%m/%Y")
@@ -224,6 +232,7 @@ class SixtyFiveScoresScraper:
 
         matches = []
         skipped_not_upcoming = 0
+        skipped_not_finished = 0
 
         if data and data.get("games"):
             for g in data["games"]:
@@ -243,6 +252,10 @@ class SixtyFiveScoresScraper:
                     skipped_not_upcoming += 1
                     continue
 
+                if only_finished and g.get("statusGroup") != 4:
+                    skipped_not_finished += 1
+                    continue
+
                 home = g.get("homeCompetitor") or {}
                 away = g.get("awayCompetitor") or {}
                 if home.get("id") is None or away.get("id") is None:
@@ -255,6 +268,13 @@ class SixtyFiveScoresScraper:
                     "away_id": away["id"],
                     "away_name": away.get("name", ""),
                     "tournament": g.get("competitionDisplayName", ""),
+                    # Only meaningful once the match has finished —
+                    # None for anything still upcoming. Carried
+                    # through purely so backtest runs can show the
+                    # real final score next to the prediction; live
+                    # (only_upcoming) runs never have this populated.
+                    "home_goals": home.get("score"),
+                    "away_goals": away.get("score"),
                 })
 
         log.info(
@@ -265,11 +285,16 @@ class SixtyFiveScoresScraper:
                 if only_upcoming
                 else ""
             )
+            + (
+                f", skipped {skipped_not_finished} not-yet-finished"
+                if only_finished
+                else ""
+            )
         )
         return matches
 
     # ---------------- TEAM HISTORY ----------------
-    def get_team_recent_matches(self, team_id, count=6):
+    def get_team_recent_matches(self, team_id, count=6, exclude_match_id=None):
         """
         Returns up to `count` of this team's most recent FINISHED
         matches, each a light dict (id, home_id, home_name, away_id,
@@ -278,6 +303,15 @@ class SixtyFiveScoresScraper:
         confirmed by direct inspection (statusGroup 4 throughout,
         startTime descending) — filtered by statusGroup defensively
         anyway in case that ever includes something else.
+
+        exclude_match_id: skip this one match id if it appears, and
+        take the count beyond it instead. Exists for backtesting a
+        past date — as of "today", the fixture being backtested is
+        itself now finished, so it would otherwise show up as this
+        team's own most recent result and leak its outcome into its
+        own "recent form" sample. No-op (id is None) for live/upcoming
+        runs, since an upcoming fixture can't appear in games/results/
+        yet anyway.
         """
         data = self._api_get(
             "games/results/",
@@ -290,6 +324,9 @@ class SixtyFiveScoresScraper:
 
         for g in data["games"]:
             if g.get("statusGroup") != 4:
+                continue
+
+            if exclude_match_id is not None and g.get("id") == exclude_match_id:
                 continue
 
             home = g.get("homeCompetitor") or {}
@@ -460,19 +497,26 @@ class SixtyFiveScoresScraper:
         }
 
     # ---------------- SCRAPER ----------------
-    def analyze_team(self, team_id, team_name=None):
+    def analyze_team(self, team_id, team_name=None, exclude_match_id=None):
         """
         Fetches this team's last 6 finished matches, each one's
         statistics, and returns the same stats dict shape the
         (unchanged) signal-evaluation functions expect — the only
         thing they care about is the abstract dict shape, not where
         the data came from.
+
+        exclude_match_id: passed straight through to
+        get_team_recent_matches — see its docstring. Used for
+        backtesting so a fixture doesn't end up in its own team's
+        "recent form" sample.
         """
         t0 = time.time()
         self.team_id = team_id
         self.team_name = team_name or str(team_id)
 
-        recent = self.get_team_recent_matches(team_id, count=6)
+        recent = self.get_team_recent_matches(
+            team_id, count=6, exclude_match_id=exclude_match_id
+        )
         results = []
         for m in recent:
             match_stats = self.get_match_statistics(
@@ -1733,12 +1777,50 @@ def main():
         default=100
     )
 
+    # ---- BACKTEST MODE ----
+    # Temporary, for validating predictions against a date that's
+    # already been played (so real scorelines exist to compare
+    # against) — see this module's TUNABLES comment history for
+    # context; not meant to stay wired into the live scheduled run.
+    parser.add_argument(
+        "--backtest",
+        action="store_true",
+        help=(
+            "Backtest mode: analyze an already-finished date's "
+            "fixtures instead of today's upcoming ones, using each "
+            "team's 6 finished matches BEFORE that fixture (its own "
+            "now-finished result is excluded from its own 'recent "
+            "form' sample, since including it would leak the outcome "
+            "being predicted into the prediction)."
+        ),
+    )
+
+    parser.add_argument(
+        "--date",
+        type=str,
+        default=None,
+        help=(
+            "DD/MM/YYYY date to analyze. Only meaningful with "
+            "--backtest; defaults to yesterday (server-local) if "
+            "--backtest is set and this is omitted."
+        ),
+    )
+
     args = parser.parse_args()
 
     START = max(0, args.start)
     LIMIT = max(1, args.limit)
 
     TARGET_COUNT = START + LIMIT
+
+    BACKTEST = args.backtest
+
+    if BACKTEST:
+        DATE_STR = args.date or time.strftime(
+            "%d/%m/%Y", time.localtime(time.time() - 86400)
+        )
+    else:
+        DATE_STR = args.date  # None -> discover_matches defaults to today
 
     BOT_TOKEN = os.getenv(
         "BOT_TOKEN",
@@ -1762,15 +1844,23 @@ def main():
         )
         return
 
+    backtest_tag = f"\n🔬 BACKTEST date={DATE_STR}" if BACKTEST else ""
+
     send_job_status(
         f"🚀 Job STARTED\n"
-        f"Batch START={START} LIMIT={LIMIT}",
+        f"Batch START={START} LIMIT={LIMIT}{backtest_tag}",
         BOT_TOKEN,
         CHAT_ID
     )
 
     log.info("Starting 365scores alert script...")
     log.info(f"Batch start={START}, limit={LIMIT}")
+    if BACKTEST:
+        log.info(
+            f"BACKTEST MODE: analyzing already-finished date "
+            f"{DATE_STR} — each team's own fixture is excluded from "
+            f"its own recent-form sample."
+        )
 
     # Declared before the try block so `finally` can safely check it even
     # if construction itself fails (see below).
@@ -1787,16 +1877,24 @@ def main():
 
         matches = scraper.discover_matches(
             TARGET_COUNT,
+            date_str=DATE_STR,
             # Only fixtures that haven't kicked off yet — no point
             # spending a full analysis on a match that's already live
             # or finished. Left False (default) everywhere else
             # discover_matches is called — e.g. inside analyze_team,
             # pulling a team's past 6 results, which are *supposed* to
-            # already be finished.
-            only_upcoming=True
+            # already be finished. Backtest mode flips this around:
+            # DATE_STR is a past date, so every fixture on it should
+            # already be finished (only_finished=True) rather than
+            # upcoming.
+            only_upcoming=(not BACKTEST),
+            only_finished=BACKTEST,
         )
 
-        log.info(f"Found {len(matches)} upcoming matches total")
+        log.info(
+            f"Found {len(matches)} "
+            f"{'finished' if BACKTEST else 'upcoming'} matches total"
+        )
 
         batch_matches = matches[
             START:START + LIMIT
@@ -1813,7 +1911,7 @@ def main():
 
             send_job_status(
                 f"⚠️ Job FINISHED (No matches)\n"
-                f"Batch START={START} LIMIT={LIMIT}",
+                f"Batch START={START} LIMIT={LIMIT}{backtest_tag}",
                 BOT_TOKEN,
                 CHAT_ID
             )
@@ -1833,9 +1931,25 @@ def main():
             home = match["home_name"]
             away = match["away_name"]
 
+            # Only populated in backtest mode (discover_matches only
+            # captures these from a finished game) — lets the log and
+            # any fired alert show the real result right next to the
+            # prediction, no manual cross-referencing needed.
+            actual_result = None
+            if (
+                BACKTEST
+                and match.get("home_goals") is not None
+                and match.get("away_goals") is not None
+            ):
+                actual_result = (
+                    f"{home} {int(match['home_goals'])}-"
+                    f"{int(match['away_goals'])} {away}"
+                )
+
             log.info(
                 f"Processing match {idx}: {home} vs {away} "
                 f"({match.get('tournament', '')}) {m_url}"
+                + (f" | ACTUAL: {actual_result}" if actual_result else "")
             )
 
             try:
@@ -1850,7 +1964,14 @@ def main():
 
                 try:
                     home_data = scraper.analyze_team(
-                        match["home_id"], match["home_name"]
+                        match["home_id"],
+                        match["home_name"],
+                        # No-op in live mode: an upcoming fixture can't
+                        # already be in games/results/. In backtest
+                        # mode this keeps the fixture's own now-known
+                        # result out of the "recent form" it's judged
+                        # against.
+                        exclude_match_id=match["id"],
                     )
                 except Exception as e:
                     home_data = None
@@ -1858,7 +1979,9 @@ def main():
 
                 try:
                     away_data = scraper.analyze_team(
-                        match["away_id"], match["away_name"]
+                        match["away_id"],
+                        match["away_name"],
+                        exclude_match_id=match["id"],
                     )
                 except Exception as e:
                     away_data = None
@@ -1946,6 +2069,12 @@ def main():
                 for label, sig_msg in fired_signals:
                     if sig_msg:
                         any_fired = True
+                        if actual_result:
+                            sig_msg = (
+                                f"🔬 *BACKTEST* — Actual result: "
+                                f"{_escape_markdown(actual_result)}\n\n"
+                                + sig_msg
+                            )
                         log.info(f"ALERT ({label}):\n" + sig_msg)
                         scraper.send_telegram_message(
                             sig_msg,
@@ -1954,7 +2083,10 @@ def main():
                         )
 
                 if not any_fired:
-                    log.info("No signals found.")
+                    log.info(
+                        "No signals found."
+                        + (f" ACTUAL: {actual_result}" if actual_result else "")
+                    )
 
             except Exception as match_err:
                 # A single bad match (missing data, timeout, etc.)
@@ -1968,7 +2100,7 @@ def main():
 
         send_job_status(
             f"✅ Job FINISHED\n"
-            f"Batch START={START} LIMIT={LIMIT}",
+            f"Batch START={START} LIMIT={LIMIT}{backtest_tag}",
             BOT_TOKEN,
             CHAT_ID
         )
@@ -1980,7 +2112,7 @@ def main():
 
         send_job_status(
             f"❌ Job FAILED\n"
-            f"Batch START={START} LIMIT={LIMIT}\n"
+            f"Batch START={START} LIMIT={LIMIT}{backtest_tag}\n"
             f"Error: {str(e)}",
             BOT_TOKEN,
             CHAT_ID
