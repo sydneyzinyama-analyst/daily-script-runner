@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import json
 import logging
 import multiprocessing
 import queue
@@ -33,37 +34,31 @@ log = logging.getLogger("flashscore")
 
 
 # ---------------- DIAGNOSTIC / FAIL-FAST TUNABLES ----------------
-# Added while chasing a "this got much slower all of a sudden in Actions"
-# regression: navigations were pinned at a flat 90s timeout with zero
-# timing/visibility into where time was actually going, so a single
-# slow/challenged page load was indistinguishable from a healthy one
-# until it either finished or ate a full 90s. These make that visible
-# and cap the worst case instead of silently absorbing it.
+# This scraper originally targeted Flashscore's DOM and chased a "this
+# got much slower all of a sudden" regression there for most of a day:
+# navigations pinned at a flat 90s timeout with zero timing/visibility,
+# a stats "tab" click that sometimes silently hung for 480-1231+
+# seconds with no error (reproduced across three Flashscore domains,
+# with and without concurrent browsers — never resolved). Migrated to
+# Sofascore's internal JSON API instead (see SofascoreGoalsScraper's
+# docstring), which sidesteps that whole class of problem — no DOM
+# clicks, no tab to hang on. These tunables are what's left of that
+# investigation's fail-fast infrastructure, still useful for the one
+# real navigation (establishing a session) and the API-call timeouts.
 #
-# Lower this to fail faster once you've confirmed pages are genuinely
-# hanging rather than just slow; raise it back if you start seeing
-# false-negative timeouts on a healthy-but-slow connection.
+# Lower this to fail faster once you've confirmed something is
+# genuinely hanging rather than just slow; raise it back if you start
+# seeing false-negative timeouts on a healthy-but-slow connection.
 NAV_TIMEOUT_MS = int(os.getenv("SCRAPER_NAV_TIMEOUT_MS", "45000"))
 
-# Hard ceiling on how long discover_matches (and the expand_hidden_matches
-# loop it calls) is allowed to spend scrolling/expanding for one team,
-# on top of the existing max_tries cap. Without this, a page whose
-# "display matches" markup no longer matches our selector can spin
-# through all 250 tries at ~2s of sleep each — worst case ~8+ minutes —
-# per team, invisibly.
+# Hard ceiling on how long discover_matches / get_team_recent_matches
+# are allowed to spend paginating through Sofascore's API for one
+# team/date, on top of their own page-count caps. Without this, an
+# API response shape change could spin through many pages indefinitely.
 DISCOVER_TIME_BUDGET_SEC = int(os.getenv("SCRAPER_DISCOVER_BUDGET_SEC", "60"))
 
-# Timeout for get_match_data's in-page Stats-tab click + the wait for
-# the stats table to render. Was a hardcoded 5s click + 15s wait (20s
-# worst case) with zero logging — invisible in the log as a multi-
-# minute gap once it happened on several matches in a row. Now timed
-# (see get_match_data) and tunable; small/regional-league matches
-# often have no Stats tab at all, so hitting this timeout is expected
-# to happen sometimes, not necessarily a bug.
-STATS_TAB_TIMEOUT_MS = int(os.getenv("SCRAPER_STATS_TAB_TIMEOUT_MS", "8000"))
-
 # How many analyze_team() calls a single browser process handles
-# before FlashscoreGoalsScraper.maybe_recycle_browser() closes and
+# before SofascoreGoalsScraper.maybe_recycle_browser() closes and
 # relaunches it. See maybe_recycle_browser's docstring for the
 # investigation that motivated this — was previously implicitly "1"
 # (a fresh browser process per team, per match), which is what led
@@ -71,10 +66,12 @@ STATS_TAB_TIMEOUT_MS = int(os.getenv("SCRAPER_STATS_TAB_TIMEOUT_MS", "8000"))
 BROWSER_RECYCLE_EVERY = int(os.getenv("SCRAPER_BROWSER_RECYCLE_EVERY", "40"))
 
 # Title substrings seen on common bot-mitigation interstitials
-# (Cloudflare, DataDome, generic "checking your browser" pages). If a
-# page we expect to be a normal Flashscore page shows one of these
-# instead, that's a strong signal we're being challenged/slow-walked
-# rather than just experiencing normal latency.
+# (Cloudflare, DataDome, generic "checking your browser" pages). Only
+# relevant to the one real page load per session (establishing
+# cookies/fingerprint before any API fetch) — if that page shows one
+# of these instead of the real Sofascore homepage, that's a strong
+# signal we're being challenged rather than just experiencing normal
+# latency.
 BOT_CHALLENGE_MARKERS = (
     "just a moment",
     "checking your browser",
@@ -177,7 +174,32 @@ def send_job_status(message, bot_token, chat_id):
 
 
 # ---------------- SCRAPER CLASS ----------------
-class FlashscoreGoalsScraper:
+class SofascoreGoalsScraper:
+    """
+    Talks to Sofascore's own internal JSON API (the same one their React
+    app calls) rather than DOM-scraping. Playwright is only used to
+    establish one legitimate browser session (a real page load gives us
+    real cookies/fingerprint) — every actual data fetch after that goes
+    through page.evaluate()-executed fetch() calls against
+    www.sofascore.com/api/v1/..., which returns clean structured JSON.
+
+    This matters because a bare `requests.get()` to these same endpoints
+    is blocked outright (403), even with a spoofed browser User-Agent —
+    confirmed by direct testing — but the identical request made from
+    inside an actual loaded page succeeds cleanly. Real bot protection
+    exists at the API layer, keyed to session/fingerprint, not headers
+    alone.
+
+    This also sidesteps the entire class of problem a prior Flashscore-
+    based version of this scraper fought for most of a day: DOM click
+    races, a stats "tab" that sometimes silently hung for 480-1231+
+    seconds with no error (reproduced across three Flashscore domains,
+    with and without concurrent browsers — never resolved), and
+    fragile CSS selectors. There's no tab to click here — every value
+    is a plain HTTP GET with a real AbortController timeout, so a stuck
+    request fails cleanly and fast instead of hanging indefinitely.
+    """
+
     def __init__(self, headless=True):
         self.headless = headless
         self.playwright = sync_playwright().start()
@@ -186,13 +208,14 @@ class FlashscoreGoalsScraper:
         self.page = None
         self._session_count = 0
         self._launch_browser()
-        self.team_url = ""
-        self.team_slug = ""
-        self.team_label = ""
+        self.team_id = None
+        self.team_name = None
 
     def _new_context(self):
         # Factored out so both _launch_browser and new_session (below)
-        # create contexts with identical settings.
+        # create contexts with identical settings, and both establish a
+        # fresh legitimate session via one real page load before any
+        # API fetch is attempted through it.
         self.context = self.browser.new_context(
             viewport={"width": 1280, "height": 900},
             user_agent=(
@@ -202,18 +225,26 @@ class FlashscoreGoalsScraper:
         )
         self.context.route("**/*", _block_heavy_resources)
         self.page = self.context.new_page()
+        self._establish_session()
+
+    def _establish_session(self):
+        try:
+            self.page.goto(
+                "https://www.sofascore.com/",
+                wait_until="domcontentloaded",
+                timeout=NAV_TIMEOUT_MS,
+            )
+            self._check_bot_challenge("session establishment")
+        except Exception as e:
+            log.warning(f"Failed to establish Sofascore session: {e}")
 
     def _launch_browser(self):
-        # Factored out of __init__ so maybe_recycle_browser (below) can
-        # relaunch with identical settings instead of duplicating them.
+        # --no-sandbox / --disable-dev-shm-usage are required in most
+        # scheduler contexts: cron/systemd jobs often run as root (where
+        # Chromium's sandbox refuses to start without --no-sandbox) or
+        # in containers with a tiny /dev/shm.
         self.browser = self.playwright.chromium.launch(
             headless=self.headless,
-            # --no-sandbox / --disable-dev-shm-usage are required in most
-            # scheduler contexts: cron/systemd jobs often run as root (where
-            # Chromium's sandbox refuses to start without --no-sandbox) or
-            # in containers with a tiny /dev/shm. Without these flags the
-            # browser can fail to launch even though it works fine when you
-            # run the script by hand as a regular user.
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
@@ -225,21 +256,10 @@ class FlashscoreGoalsScraper:
 
     def new_session(self):
         """
-        Closes the current context and opens a fresh one on the SAME
-        browser process — new cookies, localStorage, sessionStorage,
-        no carryover from whatever the previous context did. Call this
-        between logical units of work (e.g. once per team, before
-        analyze_team) that need isolation from each other.
-
-        This is the cheap half of what a full relaunch used to buy you
-        for free: a brand-new FlashscoreGoalsScraper per match gave
-        every team a completely clean browser AND cost a full Chromium
-        process launch/teardown to do it — which turned out to be the
-        cause of a serious resource-exhaustion regression (see
-        maybe_recycle_browser). Closing/reopening a context instead of
-        the whole process gives the same session isolation for a small
-        fraction of the cost, so it's safe to call every match instead
-        of only every BROWSER_RECYCLE_EVERY like the full recycle.
+        Closes the current context and opens a fresh one (new cookies,
+        new session) on the SAME browser process. Call this between
+        logical units of work (e.g. once per team, before analyze_team)
+        that need isolation from each other.
         """
         try:
             if self.context is not None:
@@ -250,19 +270,9 @@ class FlashscoreGoalsScraper:
         self._new_context()
 
     def maybe_recycle_browser(self):
-        # Was: a brand-new FlashscoreGoalsScraper (full Playwright +
-        # Chromium launch) built and torn down for every single team,
-        # every single match — up to ~200 browser launches in a
-        # 100-match batch. A logged run showed this snowballing partway
-        # through a batch into multi-hundred/multi-thousand-second
-        # stalls on operations budgeted at 8s, with unrelated matches
-        # stalling for near-identical durations simultaneously — the
-        # signature of host-level resource starvation (process/memory
-        # accumulation), not per-page network issues. The fix: reuse
-        # one browser across many teams' analyze_team() calls (call
-        # this between them) instead of relaunching per team, with a
-        # periodic full recycle as a safety net against any slower
-        # leak inside a single very-long-lived Chromium process.
+        # Periodic full relaunch as a safety net against any slow
+        # leak inside a single very-long-lived Chromium process — see
+        # BROWSER_RECYCLE_EVERY's comment.
         self._session_count += 1
 
         if self._session_count < BROWSER_RECYCLE_EVERY:
@@ -286,135 +296,7 @@ class FlashscoreGoalsScraper:
 
         self._launch_browser()
 
-    # ---------------- TELEGRAM ----------------
-    def send_telegram_message(self, message, bot_token, chat_id):
-        try:
-            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-            # Alert messages use Telegram's legacy Markdown for bold
-            # section headers (see evaluate_home_margin_signal) — team
-            # names are pre-escaped there so this doesn't choke on
-            # stray _ / * / ` / [ characters.
-            payload = {
-                "chat_id": chat_id,
-                "text": message,
-                "parse_mode": "Markdown",
-            }
-            r = requests.post(url, data=payload, timeout=20)
-            if r.status_code != 200:
-                log.warning(f"Telegram error: {r.text}")
-        except Exception as e:
-            log.error(f"Failed to send Telegram message: {e}")
-
-    # ---------------- HELPERS ----------------
-    def normalize_name(self, text):
-        if not text:
-            return ""
-        text = unicodedata.normalize("NFKD", text)
-        text = text.encode("ascii", "ignore").decode("ascii")
-        return re.sub(r"[^a-z0-9]+", "", text.lower())
-
-    def slug_to_team_name(self, slug):
-        if not slug:
-            return ""
-        return slug.replace("-", " ").strip().title()
-
-    def extract_team_slug_from_url(self, team_url):
-        try:
-            path_parts = urlparse(team_url).path.strip("/").split("/")
-            if len(path_parts) >= 2 and path_parts[0] == "team":
-                return path_parts[1]
-        except Exception:
-            pass
-        return ""
-
-    def _abs_url(self, href):
-        if not href:
-            return ""
-        if href.startswith("http"):
-            return href
-        # www.flashscore.com, not .co.za: confirmed by direct testing
-        # that .co.za specifically stalls the stats-tab fetch for
-        # 480-1231+ seconds on matches where the identical match ID
-        # resolves on .com in ~2.6s — same browser/fingerprints, same
-        # network, only the domain differs. Team/match IDs are shared
-        # across domains; only the URL path prefix differs
-        # (.co.za uses /match/soccer/, .com uses /match/football/) —
-        # irrelevant here since every URL actually used is scraped from
-        # the page's own hrefs, never constructed with a hardcoded path
-        # segment, so no other code needed to change for this switch.
-        return "https://www.flashscore.com" + href
-
-    def _safe_text(self, selector):
-        try:
-            loc = self.page.locator(selector)
-            if loc.count() > 0:
-                text = loc.first.inner_text().strip()
-                return text
-        except Exception:
-            pass
-        return ""
-
-    def _safe_attr(self, selector, attr_name="href"):
-        try:
-            loc = self.page.locator(selector)
-            if loc.count() > 0:
-                val = loc.first.get_attribute(attr_name)
-                if val:
-                    return val
-        except Exception:
-            pass
-        return ""
-
-    def _wait_ready(self, selector, timeout=15000):
-        # Replaces a blind time.sleep(N) after page.goto with waiting
-        # for the thing we're actually about to read to be visible.
-        # Measured against the live site: this is ~3-5x faster than a
-        # flat 3s sleep in the common case, since most pages render
-        # the target content well under a second — and it's strictly
-        # no worse in the slow case, since it still gives up after
-        # `timeout` and lets the caller's own extraction (_safe_text/
-        # _safe_attr, which fail soft) take it from there.
-        try:
-            self.page.locator(selector).first.wait_for(
-                state="visible", timeout=timeout
-            )
-        except Exception:
-            pass
-
-    def _timed_goto(self, url, **kwargs):
-        # Every navigation in this class routes through here now so a
-        # slow run's log shows exactly which page loads are the ones
-        # ballooning, instead of the whole discover/analyze pipeline
-        # being one opaque gap between log lines. kwargs are passed
-        # straight through to page.goto (wait_until, timeout, ...).
-        #
-        # NOTE: a hard, OS-enforced timeout wrapper (run this in a
-        # worker thread, force-close the browser if it didn't return in
-        # time) was attempted here and reverted — Playwright's sync API
-        # is thread-affine: calling self.page.goto() from any thread
-        # other than the one that created it fails immediately with
-        # "Cannot switch to a different thread", regardless of whether
-        # anything is actually slow. That would have broken every
-        # single call, not just the pathological ones. A real fix for
-        # the underlying ~1231s stalls (see investigation notes on
-        # STATS_TAB_TIMEOUT_MS) needs a genuinely separate OS process,
-        # not a thread, to get real hard-kill capability.
-        t0 = time.time()
-        try:
-            self.page.goto(url, **kwargs)
-            elapsed = time.time() - t0
-            log.info(f"goto {url} took {elapsed:.1f}s")
-        except Exception as e:
-            elapsed = time.time() - t0
-            log.warning(f"goto {url} failed after {elapsed:.1f}s: {e}")
-            raise
-
     def _check_bot_challenge(self, context_label=""):
-        # Cheap check for a bot-mitigation interstitial: if we're
-        # sitting on a "Just a moment..."-style page instead of the
-        # real Flashscore page, every downstream selector wait will
-        # silently time out and *look* like ordinary slowness. This
-        # makes that distinguishable in the log instead of guessing.
         try:
             title = (self.page.title() or "").strip()
         except Exception:
@@ -422,247 +304,182 @@ class FlashscoreGoalsScraper:
 
         if any(marker in title.lower() for marker in BOT_CHALLENGE_MARKERS):
             log.warning(
-                f"POSSIBLE BOT CHALLENGE{' (' + context_label + ')' if context_label else ''}: "
+                f"POSSIBLE BOT CHALLENGE"
+                f"{' (' + context_label + ')' if context_label else ''}: "
                 f"page title={title!r} url={self.page.url!r}"
             )
             return True
 
         return False
 
-    def _parse_stat_value(self, text):
-        # Stats on the overall/stats page come in a few shapes:
-        #   "19"                -> plain count
-        #   "1.59"               -> decimal (xG, xGOT, goals prevented)
-        #   "-0.43"              -> negative decimal (goals prevented)
-        #   "76%\n(262/343)"     -> percentage stats (passes, possession...)
-        # We only need the leading number in every case.
-        if not text:
+    def _api_get(self, path, timeout_ms=None):
+        """
+        Fetches a Sofascore API path via the browser's own fetch(),
+        using its already-established session/cookies — see the class
+        docstring for why a bare requests.get() to these same paths is
+        blocked (403) while this isn't. Uses a real AbortController on
+        the JS side so a stuck request is genuinely cancelled at the
+        network layer after timeout_ms, not just abandoned by our own
+        code while the underlying fetch keeps running.
+
+        Returns the parsed JSON body, or None (logged) on any failure:
+        network error, timeout, non-2xx status, or invalid JSON.
+        """
+        if timeout_ms is None:
+            timeout_ms = NAV_TIMEOUT_MS
+
+        t0 = time.time()
+        try:
+            result = self.page.evaluate(
+                """async ({ path, timeoutMs }) => {
+                    const controller = new AbortController();
+                    const timer = setTimeout(() => controller.abort(), timeoutMs);
+                    try {
+                        const r = await fetch(path, {
+                            headers: { 'Accept': 'application/json' },
+                            signal: controller.signal,
+                        });
+                        const text = await r.text();
+                        return { ok: r.ok, status: r.status, text: text };
+                    } catch (e) {
+                        return { ok: false, status: 0, text: String(e) };
+                    } finally {
+                        clearTimeout(timer);
+                    }
+                }""",
+                {"path": path, "timeoutMs": timeout_ms},
+            )
+        except Exception as e:
+            log.warning(
+                f"API GET {path} evaluate() failed after "
+                f"{time.time()-t0:.1f}s: {e}"
+            )
             return None
 
-        text = text.strip()
+        elapsed = time.time() - t0
 
-        pct_match = re.match(r"^(-?\d+(?:\.\d+)?)\s*%", text)
-        if pct_match:
-            return float(pct_match.group(1))
-
-        num_match = re.match(r"^-?\d+(?:\.\d+)?", text)
-        if num_match:
-            try:
-                return float(num_match.group(0))
-            except ValueError:
-                return None
-
-        return None
-
-    def accept_cookies(self):
-        # Flashscore (and most EU-facing sites) show a cookie consent
-        # overlay on first visit. A scheduler always starts a fresh
-        # browser context (no saved consent cookie), so this overlay can
-        # intercept clicks and silently break discovery/expansion that
-        # worked fine in your already-consented local browser session.
-        selectors = [
-            "#onetrust-accept-btn-handler",
-            "button:has-text('Accept')",
-            "button:has-text('I Accept')",
-        ]
-        for selector in selectors:
-            try:
-                btn = self.page.locator(selector)
-                if btn.count() > 0 and btn.first.is_visible():
-                    btn.first.click(timeout=3000)
-                    time.sleep(1)
-                    return
-            except Exception:
-                continue
-
-    def get_team_name_from_page(self):
-        selectors = [
-            "h1",
-            ".heading__name",
-            ".participant__participantName a",
-            ".participant__participantName",
-        ]
-        for selector in selectors:
-            try:
-                loc = self.page.locator(selector)
-                if loc.count() > 0:
-                    text = loc.first.inner_text().strip()
-                    if text:
-                        text = re.sub(r"^Soccer:\s*", "", text, flags=re.IGNORECASE)
-                        text = re.sub(r"\s+results?\s*$", "", text, flags=re.IGNORECASE)
-                        return text
-            except Exception:
-                pass
-        return ""
-
-    # ---------------- SCRAPER ----------------
-    def open_team_results(self, team_url):
-        self.team_url = team_url
-        self.team_slug = self.extract_team_slug_from_url(team_url)
-        self.team_label = self.slug_to_team_name(self.team_slug)
-        url = team_url.rstrip("/") + "/results/"
-        log.info(f"Opening results page: {url}")
-        try:
-            self._timed_goto(url, wait_until="load", timeout=NAV_TIMEOUT_MS)
-            self._wait_ready("h1", timeout=10000)
-            self._check_bot_challenge(f"results page for {self.team_slug}")
-            self.accept_cookies()
-            page_name = self.get_team_name_from_page()
-            if page_name:
-                self.team_label = page_name
-            return True
-        except Exception as e:
-            log.error(f"Failed to load results: {e}")
-            return False
-
-    def expand_hidden_matches(self):
-        # Bounded by both an iteration count and a wall-clock budget
-        # (whichever hits first) so a "display matches" button that
-        # keeps reappearing — e.g. after a markup change — can't turn
-        # this into an unbounded loop hiding inside discover_matches'
-        # own retry budget.
-        t0 = time.time()
-        iterations = 0
-        max_iterations = 40
-
-        try:
-            while True:
-                if time.time() - t0 > DISCOVER_TIME_BUDGET_SEC:
-                    log.warning(
-                        f"expand_hidden_matches hit its "
-                        f"{DISCOVER_TIME_BUDGET_SEC}s time budget after "
-                        f"{iterations} iterations, giving up for this pass"
-                    )
-                    break
-
-                if iterations >= max_iterations:
-                    log.warning(
-                        f"expand_hidden_matches hit max_iterations="
-                        f"{max_iterations}, giving up for this pass"
-                    )
-                    break
-
-                iterations += 1
-
-                btns = self.page.locator("text=/display matches/i")
-                count = btns.count()
-
-                if count == 0:
-                    break
-
-                clicked = 0
-
-                for i in range(count):
-                    try:
-                        btn = btns.nth(i)
-                        if btn.is_visible():
-                            btn.click(timeout=5000)
-                            clicked += 1
-                            time.sleep(0.3)
-                    except Exception as e:
-                        log.warning(f"Skipping button {i}: {e}")
-
-                if clicked == 0:
-                    break
-
-                time.sleep(1)
-
-        except Exception as e:
-            log.warning(f"expand_hidden_matches failed: {e}")
-
-    def _is_match_upcoming(self, link):
-        """
-        True if `link` (an <a href*='/match/'> Locator on the fixtures
-        page) belongs to a match that hasn't started yet. Flashscore
-        tags each match row's class with 'event__match--scheduled' for
-        not-yet-started, 'event__match--live' for in progress, and
-        neither for already-finished (row text starts "Finished", full
-        score already filled in) — confirmed against the live site.
-
-        Only meaningful on the fixtures/upcoming page. discover_matches
-        is also used against a team's *results* page to pull their past
-        6 matches for stats (see analyze_team) — those rows are
-        supposed to be finished, so this check is opt-in via
-        only_upcoming rather than applied unconditionally.
-
-        Fails open (returns True, i.e. don't skip) on any lookup
-        failure or unrecognized row structure — the existing behavior
-        of analyzing a match we shouldn't have is far less bad than
-        silently dropping matches because a markup detail shifted.
-        """
-        try:
-            row = link.locator(
-                "xpath=ancestor::div[contains(@class,'event__match')][1]"
+        if not result or not result.get("ok"):
+            log.warning(
+                f"API GET {path} failed after {elapsed:.1f}s: "
+                f"status={result.get('status') if result else '?'} "
+                f"body={str(result.get('text') if result else '')[:200]!r}"
             )
-            if row.count() == 0:
-                return True
+            return None
 
-            cls = row.first.get_attribute("class") or ""
-            return "event__match--scheduled" in cls
-        except Exception:
-            return True
+        try:
+            return json.loads(result["text"])
+        except Exception as e:
+            log.warning(
+                f"API GET {path} returned invalid JSON after "
+                f"{elapsed:.1f}s: {e}"
+            )
+            return None
 
-    def discover_matches(self, target_count, max_tries=250, only_upcoming=False):
+    # ---------------- DISCOVERY ----------------
+    def discover_matches(
+        self, target_count, date_str=None, only_upcoming=False,
+        max_tournaments=300
+    ):
+        """
+        Returns up to `target_count` match dicts for `date_str`
+        (today, server-local, if not given): each
+        {id, home_id, home_name, away_id, away_name, tournament}.
+
+        Scans every tournament playing that date (paginating
+        scheduled-tournaments -> scheduled-events per tournament) until
+        target_count is reached or tournaments run out. When
+        only_upcoming is True, skips anything whose status isn't
+        "notstarted" — no point predicting on a match that's already
+        live or finished.
+        """
+        if date_str is None:
+            date_str = time.strftime("%Y-%m-%d")
+
         matches = []
-        seen = set()
-        tries = 0
+        seen_ids = set()
         skipped_not_upcoming = 0
+        tournament_page = 1
+        tournaments_scanned = 0
         t0 = time.time()
 
-        while len(matches) < target_count and tries < max_tries:
+        while len(matches) < target_count and tournaments_scanned < max_tournaments:
             if time.time() - t0 > DISCOVER_TIME_BUDGET_SEC:
                 log.warning(
-                    f"discover_matches for {self.team_label or self.team_slug!r} "
-                    f"hit its {DISCOVER_TIME_BUDGET_SEC}s time budget after "
-                    f"{tries} tries with {len(matches)}/{target_count} found "
-                    f"— stopping early instead of grinding to max_tries"
+                    f"discover_matches hit its {DISCOVER_TIME_BUDGET_SEC}s "
+                    f"time budget after scanning {tournaments_scanned} "
+                    f"tournaments, {len(matches)}/{target_count} found "
+                    f"— stopping early"
                 )
                 break
 
-            self.expand_hidden_matches()
-
-            links = self.page.locator("a[href*='/match/'][href*='?mid=']").all()
-            for link in links:
-                href = link.get_attribute("href")
-                if not href:
-                    continue
-
-                href = href.split("/tv")[0].split("#")[0]
-                full_url = self._abs_url(href)
-
-                if full_url in seen or "?mid=" not in full_url:
-                    continue
-
-                if only_upcoming and not self._is_match_upcoming(link):
-                    # Already live or finished — no point spending a
-                    # full analyze_team() pass predicting a match that
-                    # has already happened. Still mark as seen so we
-                    # don't keep re-checking the same row every retry
-                    # pass, but don't count it toward target_count.
-                    seen.add(full_url)
-                    skipped_not_upcoming += 1
-                    continue
-
-                matches.append(full_url)
-                seen.add(full_url)
-
-                if len(matches) >= target_count:
-                    break
-
-            if len(matches) >= target_count:
+            page_data = self._api_get(
+                f"/api/v1/sport/football/scheduled-tournaments/"
+                f"{date_str}/page/{tournament_page}"
+            )
+            if not page_data or not page_data.get("scheduled"):
                 break
 
-            try:
-                self.page.mouse.wheel(0, 6000)
-            except Exception:
-                pass
+            tournament_ids = []
+            for entry in page_data["scheduled"]:
+                # uniqueTournament is nested inside tournament here, not
+                # a sibling of it — confirmed by direct inspection, not
+                # assumption (an earlier raw single-line JSON slice was
+                # misleading about the actual nesting depth).
+                tournament = entry.get("tournament") or {}
+                ut = tournament.get("uniqueTournament") or {}
+                ut_id = ut.get("id")
+                if ut_id is not None:
+                    tournament_ids.append(ut_id)
 
-            time.sleep(2)
-            tries += 1
+            for ut_id in tournament_ids:
+                if len(matches) >= target_count:
+                    break
+                if time.time() - t0 > DISCOVER_TIME_BUDGET_SEC:
+                    break
+
+                tournaments_scanned += 1
+                events_data = self._api_get(
+                    f"/api/v1/unique-tournament/{ut_id}/scheduled-events/{date_str}"
+                )
+                if not events_data or not events_data.get("events"):
+                    continue
+
+                for e in events_data["events"]:
+                    eid = e.get("id")
+                    if eid is None or eid in seen_ids:
+                        continue
+
+                    status_type = (e.get("status") or {}).get("type")
+                    if only_upcoming and status_type != "notstarted":
+                        seen_ids.add(eid)
+                        skipped_not_upcoming += 1
+                        continue
+
+                    home = e.get("homeTeam") or {}
+                    away = e.get("awayTeam") or {}
+                    if home.get("id") is None or away.get("id") is None:
+                        continue
+
+                    matches.append({
+                        "id": eid,
+                        "home_id": home["id"],
+                        "home_name": home.get("name", ""),
+                        "away_id": away["id"],
+                        "away_name": away.get("name", ""),
+                        "tournament": (e.get("tournament") or {}).get("name", ""),
+                    })
+                    seen_ids.add(eid)
+
+                    if len(matches) >= target_count:
+                        break
+
+            if not page_data.get("hasNextPage"):
+                break
+            tournament_page += 1
 
         log.info(
-            f"discover_matches for {self.team_label or self.team_slug!r}: "
-            f"found {len(matches)}/{target_count} in {tries} tries, "
+            f"discover_matches: found {len(matches)}/{target_count} "
+            f"across {tournaments_scanned} tournaments, "
             f"{time.time()-t0:.1f}s"
             + (
                 f", skipped {skipped_not_upcoming} already-started/finished"
@@ -672,485 +489,147 @@ class FlashscoreGoalsScraper:
         )
         return matches
 
-    def get_match_teams_and_links(self, match_url):
-        try:
-            self._timed_goto(
-                match_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS
-            )
-            self._wait_ready(
-                ".duelParticipant__home .participant__participantName a"
-            )
-        except Exception:
-            return None
+    # ---------------- TEAM HISTORY ----------------
+    def get_team_recent_matches(self, team_id, count=6, max_pages=6):
+        """
+        Returns up to `count` of this team's most recent FINISHED
+        matches, each a light dict (id, home_id, home_name, away_id,
+        away_name, home_goals, away_goals). Paginates
+        team/{id}/events/last/{page} since that endpoint can include
+        postponed/cancelled/awarded entries mixed in with genuinely
+        finished ones — filtered defensively by status.type.
+        """
+        results = []
+        seen_ids = set()
+        page = 0
+        t0 = time.time()
 
-        home_name = self._safe_text(
-            ".duelParticipant__home .participant__participantName a"
-        )
-        away_name = self._safe_text(
-            ".duelParticipant__away .participant__participantName a"
-        )
+        while len(results) < count and page < max_pages:
+            if time.time() - t0 > DISCOVER_TIME_BUDGET_SEC:
+                log.warning(
+                    f"get_team_recent_matches for team {team_id} hit its "
+                    f"{DISCOVER_TIME_BUDGET_SEC}s time budget with "
+                    f"{len(results)}/{count} found — stopping early"
+                )
+                break
 
-        home_href = self._safe_attr(
-            ".duelParticipant__home .participant__participantName a", "href"
-        )
-        away_href = self._safe_attr(
-            ".duelParticipant__away .participant__participantName a", "href"
-        )
+            data = self._api_get(f"/api/v1/team/{team_id}/events/last/{page}")
+            if not data or not data.get("events"):
+                break
 
-        return {
-            "home_name": home_name,
-            "away_name": away_name,
-            "home_url": self._abs_url(home_href),
-            "away_url": self._abs_url(away_href),
-            "match_url": match_url,
-        }
+            for e in data["events"]:
+                eid = e.get("id")
+                if eid is None or eid in seen_ids:
+                    continue
+                seen_ids.add(eid)
 
-    def get_match_stats_url(self, match_url):
-        try:
-            if "?mid=" not in match_url:
-                return None
+                status_type = (e.get("status") or {}).get("type")
+                if status_type != "finished":
+                    continue
 
-            base = match_url.split("?mid=")[0]
-            mid = match_url.split("?mid=")[1]
+                home = e.get("homeTeam") or {}
+                away = e.get("awayTeam") or {}
+                home_goals = (e.get("homeScore") or {}).get("current")
+                away_goals = (e.get("awayScore") or {}).get("current")
 
-            return f"{base}summary/stats/overall/?mid={mid}"
+                if home.get("id") is None or away.get("id") is None:
+                    continue
+                if home_goals is None or away_goals is None:
+                    continue
 
-        except Exception:
-            return None
+                results.append({
+                    "id": eid,
+                    "home_id": home["id"],
+                    "home_name": home.get("name", ""),
+                    "away_id": away["id"],
+                    "away_name": away.get("name", ""),
+                    "home_goals": home_goals,
+                    "away_goals": away_goals,
+                })
 
-    # Maps a stat row's category label (lowercased) to the short key we
-    # store it under. Add an entry here to pull in another stat with no
-    # other code changes needed to the scraping itself.
-    STAT_LABEL_MAP = {
-        "expected goals (xg)": "xg",
-        "xg on target (xgot)": "xgot",
-        "total shots": "shots",
-        "shots on target": "shots_on_target",
-        "corner kicks": "corners",
-        "big chances": "big_chances",
-        "yellow cards": "yellow_cards",
+                if len(results) >= count:
+                    break
+
+            if not data.get("hasNextPage"):
+                break
+            page += 1
+
+        return results
+
+    # ---------------- MATCH STATISTICS ----------------
+    # Maps a Sofascore statistics-item's JSON `key` to the short name we
+    # store it under. Sofascore has no direct xGOT ("expected goals on
+    # target") or goalkeeper "goals prevented" (an xG-based derived
+    # stat) equivalent — goalkeeperSaves is a raw save count, a
+    # different thing — so avg_xgot_for/against and
+    # avg_goals_prevented stay None for Sofascore-sourced data. Every
+    # signal-evaluation function already treats those as optional
+    # (None-safe checks throughout), so this doesn't break anything —
+    # it just means those specific corroboration bonuses never fire.
+    STAT_KEY_MAP = {
+        "expectedGoals": "xg",
+        "totalShotsOnGoal": "shots",
+        "shotsOnGoal": "shots_on_target",
+        "cornerKicks": "corners",
+        "bigChanceCreated": "big_chances",
+        "yellowCards": "yellow_cards",
         "fouls": "fouls",
-        "goals prevented": "goals_prevented",
-        "ball possession": "possession",
+        "ballPossession": "possession",
     }
 
     def _empty_stat_result(self):
         result = {}
-        for stat_key in self.STAT_LABEL_MAP.values():
+        for stat_key in set(self.STAT_KEY_MAP.values()) | {"xgot", "goals_prevented"}:
             result[f"home_{stat_key}"] = None
             result[f"away_{stat_key}"] = None
         return result
 
-    def _extract_stats_from_current_page(self):
-        """
-        Reads the STAT_LABEL_MAP fields off whatever stats page is
-        currently loaded. Shared by get_match_stats (which navigates
-        there directly) and get_match_data (which reaches the same
-        page via an in-page tab click instead of a fresh navigation —
-        see get_match_data's docstring for why that's faster).
-        """
+    def get_match_statistics(self, match_id):
         result = self._empty_stat_result()
 
-        try:
-            rows = self.page.locator(
-                "[data-testid='wcl-statistics']"
-            ).all()
-
-            for row in rows:
-                try:
-                    label = row.locator(
-                        "[data-testid='wcl-statistics-category']"
-                    ).inner_text().strip()
-
-                    stat_key = self.STAT_LABEL_MAP.get(label.lower())
-                    if not stat_key:
-                        continue
-
-                    values = row.locator(
-                        "[data-testid='wcl-statistics-value'] span"
-                    ).all()
-
-                    if len(values) < 2:
-                        continue
-
-                    result[f"home_{stat_key}"] = self._parse_stat_value(
-                        values[0].inner_text()
-                    )
-                    result[f"away_{stat_key}"] = self._parse_stat_value(
-                        values[1].inner_text()
-                    )
-
-                except Exception:
-                    continue
-
-        except Exception:
-            pass
-
-        return result
-
-    def get_match_stats(self, match_url):
-        """
-        Pulls the full set of stats we care about from the match's
-        stats/overall page in a single pass: xG, xGOT, corners, big
-        chances, yellow cards, fouls and goalkeeper "goals prevented".
-
-        Returns a dict of home_<stat>/away_<stat> pairs. Any stat not
-        found on the page (older matches, different competitions, page
-        layout differences) is left as None rather than raising.
-
-        Standalone entry point kept for callers that only want stats.
-        analyze_team uses the faster combined get_match_data instead.
-        """
-        stats_url = self.get_match_stats_url(match_url)
-
-        result = {"match_url": match_url}
-        result.update(self._empty_stat_result())
-
-        if not stats_url:
+        data = self._api_get(f"/api/v1/event/{match_id}/statistics")
+        if not data or not data.get("statistics"):
             return result
 
         try:
-            self._timed_goto(
-                stats_url,
-                wait_until="domcontentloaded",
-                timeout=NAV_TIMEOUT_MS
-            )
-            self._wait_ready("[data-testid='wcl-statistics']")
+            overall = data["statistics"][0]  # period == "ALL"
+            for group in overall.get("groups", []):
+                for item in group.get("statisticsItems", []):
+                    stat_name = self.STAT_KEY_MAP.get(item.get("key"))
+                    if not stat_name:
+                        continue
 
-        except Exception:
-            return result
-
-        result.update(self._extract_stats_from_current_page())
-        return result
-
-    def get_match_goals(self, match_url):
-        try:
-            self._timed_goto(
-                match_url,
-                wait_until="domcontentloaded",
-                timeout=NAV_TIMEOUT_MS
-            )
-            self._wait_ready(
-                ".duelParticipant__home .participant__participantName a"
-            )
-
-        except Exception:
-            return None
-
-        score_home = None
-        score_away = None
-
-        try:
-            score_spans = self.page.locator(
-                ".detailScore__wrapper span"
-            ).all()
-
-            if len(score_spans) >= 3:
-                h = score_spans[0].inner_text().strip()
-                d = score_spans[1].inner_text().strip()
-                a = score_spans[2].inner_text().strip()
-
-                if d == "-" and h.isdigit() and a.isdigit():
-                    score_home = int(h)
-                    score_away = int(a)
-
-        except Exception:
-            pass
-
-        home = self._safe_text(
-            ".duelParticipant__home .participant__participantName a"
-        ) or "?"
-
-        away = self._safe_text(
-            ".duelParticipant__away .participant__participantName a"
-        ) or "?"
-
-        return {
-            "home": home,
-            "away": away,
-            "goals_home": score_home,
-            "goals_away": score_away,
-            "match_url": match_url
-        }
-
-    def get_match_data(self, match_url):
-        """
-        Combined, faster version of get_match_goals + get_match_stats:
-        one navigation to the match page, then an in-page click on the
-        Stats tab instead of a second full page load to the stats
-        URL. Measured against the live site: ~2.1s combined vs ~2.6-
-        3.2s doing the two as separate goto()s, since this skips
-        re-fetching the whole page shell/JS bundle a second time.
-
-        Falls back to goals-only data (all stat fields None) if the
-        Stats tab isn't present/clickable — some older or lower-tier
-        matches don't have one — same degradation as calling
-        get_match_stats on a match with no stats page.
-        """
-        try:
-            self._timed_goto(
-                match_url,
-                wait_until="domcontentloaded",
-                timeout=NAV_TIMEOUT_MS
-            )
-            self._wait_ready(
-                ".duelParticipant__home .participant__participantName a"
-            )
-        except Exception:
-            return None
-
-        score_home = None
-        score_away = None
-
-        try:
-            score_spans = self.page.locator(
-                ".detailScore__wrapper span"
-            ).all()
-
-            if len(score_spans) >= 3:
-                h = score_spans[0].inner_text().strip()
-                d = score_spans[1].inner_text().strip()
-                a = score_spans[2].inner_text().strip()
-
-                if d == "-" and h.isdigit() and a.isdigit():
-                    score_home = int(h)
-                    score_away = int(a)
-
-        except Exception:
-            pass
-
-        home = self._safe_text(
-            ".duelParticipant__home .participant__participantName a"
-        ) or "?"
-
-        away = self._safe_text(
-            ".duelParticipant__away .participant__participantName a"
-        ) or "?"
-
-        match_data = {
-            "home": home,
-            "away": away,
-            "goals_home": score_home,
-            "goals_away": score_away,
-            "match_url": match_url,
-        }
-        match_data.update(self._empty_stat_result())
-
-        # This click+wait pair was the last unlogged step in the whole
-        # pipeline — every navigation goes through _timed_goto now, but
-        # this in-page tab switch doesn't navigate, so a slow/failed
-        # click here was invisible in the log: a run could show a
-        # multi-minute gap between two goto lines with nothing to
-        # explain it. Timed explicitly so that gap has a cause now.
-        #
-        # This is also the exact spot every observed multi-hundred-
-        # second stall (up to ~1231s, budgeted at 8s) traced back to. A
-        # thread-based hard-timeout wrapper was tried here and reverted
-        # — Playwright's sync API can't be called from a thread other
-        # than the one that created the page/browser at all, so it
-        # broke every call, not just the slow ones (see _timed_goto's
-        # note). Left as a plain call for now; a real fix needs a
-        # genuinely separate OS process, which is a bigger change.
-        t0 = time.time()
-        try:
-            self.page.locator("a[href*='summary/stats']").first.click(
-                timeout=STATS_TAB_TIMEOUT_MS
-            )
-            self._wait_ready(
-                "[data-testid='wcl-statistics']", timeout=STATS_TAB_TIMEOUT_MS
-            )
-            match_data.update(self._extract_stats_from_current_page())
-            log.info(
-                f"stats tab for {match_url} took {time.time()-t0:.1f}s"
-            )
+                    # Several keys (e.g. totalShotsOnGoal, totalTackle)
+                    # appear in more than one group with identical
+                    # values — keep the first occurrence only.
+                    if result.get(f"home_{stat_name}") is None:
+                        result[f"home_{stat_name}"] = item.get("homeValue")
+                    if result.get(f"away_{stat_name}") is None:
+                        result[f"away_{stat_name}"] = item.get("awayValue")
         except Exception as e:
             log.warning(
-                f"stats tab for {match_url} failed after "
-                f"{time.time()-t0:.1f}s: {e}"
+                f"Error parsing statistics for match {match_id}: {e}"
             )
 
-        return match_data
+        return result
 
-    def _team_match_score(self, a, b):
-        a_n = self.normalize_name(a)
-        b_n = self.normalize_name(b)
-
-        if not a_n or not b_n:
-            return 0.0
-
-        if a_n == b_n:
-            return 1.0
-
-        if a_n in b_n or b_n in a_n:
-            return 0.95
-
-        return SequenceMatcher(None, a_n, b_n).ratio()
-
-    def _team_matches(self, candidate, aliases, threshold=0.62):
-        for alias in aliases:
-            if not alias:
-                continue
-
-            if self._team_match_score(candidate, alias) >= threshold:
-                return True
-
-        return False
-
-    def calculate_team_goals(self, results):
-        total_goals = 0
-        matches_counted = 0
-
-        aliases = [
-            self.team_slug,
-            self.team_label,
-            self.slug_to_team_name(self.team_slug)
-        ]
-
-        for r in results:
-            home_team = r.get("home", "")
-            away_team = r.get("away", "")
-
-            if self._team_matches(home_team, aliases):
-                total_goals += r.get("goals_home") or 0
-                matches_counted += 1
-
-            elif self._team_matches(away_team, aliases):
-                total_goals += r.get("goals_away") or 0
-                matches_counted += 1
-
-        avg_goals = (
-            total_goals / matches_counted
-            if matches_counted > 0
-            else 0
-        )
-
-        return {
-            "team": self.team_label or self.team_slug,
-            "total_goals": total_goals,
-            "avg_goals": round(avg_goals, 2),
-            "matches": matches_counted
-        }
-
-    def calculate_team_goals_conceded(self, results):
-        total_conceded = 0
-        counted = 0
-
-        aliases = [
-            self.team_slug,
-            self.team_label,
-            self.slug_to_team_name(self.team_slug)
-        ]
-
-        for r in results:
-            home_team = r.get("home", "")
-            away_team = r.get("away", "")
-
-            if self._team_matches(home_team, aliases):
-                total_conceded += r.get("goals_away") or 0
-                counted += 1
-
-            elif self._team_matches(away_team, aliases):
-                total_conceded += r.get("goals_home") or 0
-                counted += 1
-
-        avg_conceded = (
-            total_conceded / counted
-            if counted > 0
-            else 0
-        )
-
-        return round(avg_conceded, 2)
-
-    def calculate_team_xg(self, results):
-        total_xg = 0
-        counted = 0
-
-        aliases = [
-            self.team_slug,
-            self.team_label,
-            self.slug_to_team_name(self.team_slug)
-        ]
-
-        for r in results:
-            home_team = r.get("home", "")
-            away_team = r.get("away", "")
-
-            if self._team_matches(home_team, aliases):
-                if r.get("home_xg") is not None:
-                    total_xg += r["home_xg"]
-                    counted += 1
-
-            elif self._team_matches(away_team, aliases):
-                if r.get("away_xg") is not None:
-                    total_xg += r["away_xg"]
-                    counted += 1
-
-        if counted == 0:
-            return None
-
-        return round(total_xg / counted, 2)
-
-    def calculate_team_xga(self, results):
-        total_xga = 0
-        counted = 0
-
-        aliases = [
-            self.team_slug,
-            self.team_label,
-            self.slug_to_team_name(self.team_slug)
-        ]
-
-        for r in results:
-            home_team = r.get("home", "")
-            away_team = r.get("away", "")
-
-            if self._team_matches(home_team, aliases):
-                if r.get("away_xg") is not None:
-                    total_xga += r["away_xg"]
-                    counted += 1
-
-            elif self._team_matches(away_team, aliases):
-                if r.get("home_xg") is not None:
-                    total_xga += r["home_xg"]
-                    counted += 1
-
-        if counted == 0:
-            return None
-
-        return round(total_xga / counted, 2)
-
-    def _team_stat_avg(self, results, stat_name, side="for"):
+    # ---------------- STAT AVERAGING ----------------
+    def _team_stat_avg(self, results, stat_name, team_id, side="for"):
         """
-        Generic averager for the extra stats (corners, big_chances,
-        yellow_cards, fouls, goals_prevented, xgot, shots,
-        shots_on_target, possession). Each match_data dict is expected
-        to carry home_<stat_name>/away_<stat_name> keys, as produced
-        by get_match_stats().
-
-        side="for"     -> the analyzed team's own stat
-        side="against" -> the opponent's stat in that match (e.g. big
-                           chances *faced*, useful for BTTS-style
-                           signals where "for" alone isn't enough)
+        Generic averager for every per-match stat (goals, xg, corners,
+        cards, ...): side="for" -> team_id's own stat_name in each
+        match; side="against" -> the opponent's. Matches by exact team
+        ID rather than the fuzzy name-aliasing a DOM-scraped version
+        would need (team_slug/team_label/normalize_name) — Sofascore's
+        IDs are unambiguous, so that whole apparatus is unnecessary
+        here.
         """
         total = 0
         counted = 0
 
-        aliases = [
-            self.team_slug,
-            self.team_label,
-            self.slug_to_team_name(self.team_slug)
-        ]
-
         for r in results:
-            home_team = r.get("home", "")
-            away_team = r.get("away", "")
-
-            is_home = self._team_matches(home_team, aliases)
-            is_away = (
-                not is_home
-                and self._team_matches(away_team, aliases)
-            )
-
+            is_home = r.get("home_id") == team_id
+            is_away = r.get("away_id") == team_id
             if not is_home and not is_away:
                 continue
 
@@ -1178,47 +657,64 @@ class FlashscoreGoalsScraper:
 
         return round(total / counted, 2)
 
-    def analyze_team(self, team_url):
-        # Logged so total per-team time is visible even though the two
-        # teams' analyze_team calls run concurrently in separate threads
-        # and their goto/discover_matches lines interleave in the log —
-        # this line bounds where each team's slice actually started and
-        # ended.
+    def calculate_team_goals(self, results, team_id):
+        total_goals = 0
+        matches_counted = 0
+
+        for r in results:
+            if r.get("home_id") == team_id:
+                total_goals += r.get("home_goals") or 0
+                matches_counted += 1
+            elif r.get("away_id") == team_id:
+                total_goals += r.get("away_goals") or 0
+                matches_counted += 1
+
+        avg_goals = (
+            total_goals / matches_counted if matches_counted > 0 else 0
+        )
+
+        return {
+            "team": self.team_name or str(team_id),
+            "total_goals": total_goals,
+            "avg_goals": round(avg_goals, 2),
+            "matches": matches_counted,
+        }
+
+    # ---------------- SCRAPER ----------------
+    def analyze_team(self, team_id, team_name=None):
+        """
+        Fetches this team's last 6 finished matches, each one's
+        statistics, and returns the same stats dict shape the
+        (unchanged) signal-evaluation functions expect — the only
+        thing they care about is the abstract dict shape, not where
+        the data came from.
+        """
         t0 = time.time()
+        self.team_id = team_id
+        self.team_name = team_name or str(team_id)
 
-        if not self.open_team_results(team_url):
-            return None
-
-        matches = self.discover_matches(6)
+        recent = self.get_team_recent_matches(team_id, count=6)
         results = []
-
-        for url in matches:
-            match_data = self.get_match_data(url)
-
-            if match_data:
-                results.append(match_data)
+        for m in recent:
+            match_stats = self.get_match_statistics(m["id"])
+            match_data = dict(m)
+            match_data.update(match_stats)
+            results.append(match_data)
 
         log.info(
-            f"analyze_team({self.team_label or self.team_slug!r}): "
-            f"{len(results)}/{len(matches)} matches fetched in "
-            f"{time.time()-t0:.1f}s total"
+            f"analyze_team({self.team_name!r}): {len(results)}/6 "
+            f"matches fetched in {time.time()-t0:.1f}s total"
         )
 
-        stats = self.calculate_team_goals(results)
-        avg_gc = self.calculate_team_goals_conceded(results)
-        avg_xg = self.calculate_team_xg(results)
-        avg_xga = self.calculate_team_xga(results)
+        stats = self.calculate_team_goals(results, team_id)
+        avg_gc = self._team_stat_avg(results, "goals", team_id, "against") or 0
+        avg_xg = self._team_stat_avg(results, "xg", team_id, "for")
+        avg_xga = self._team_stat_avg(results, "xg", team_id, "against")
 
-        avg_gd = round(
-            stats["avg_goals"] - avg_gc,
-            2
-        )
+        avg_gd = round(stats["avg_goals"] - avg_gc, 2)
 
         if avg_xg is not None and avg_xga is not None:
-            avg_xgd = round(
-                avg_xg - avg_xga,
-                2
-            )
+            avg_xgd = round(avg_xg - avg_xga, 2)
         else:
             avg_xgd = None
 
@@ -1228,31 +724,43 @@ class FlashscoreGoalsScraper:
             "avg_xg": avg_xg,
             "avg_xga": avg_xga,
             "avg_xgd": avg_xgd,
-
-            # New filters: corners, big chances, cards/fouls, xGOT and
-            # goalkeeper "goals prevented".
-            "avg_corners_for": self._team_stat_avg(results, "corners", "for"),
-            "avg_corners_against": self._team_stat_avg(results, "corners", "against"),
-            "avg_big_chances_for": self._team_stat_avg(results, "big_chances", "for"),
-            "avg_big_chances_against": self._team_stat_avg(results, "big_chances", "against"),
-            "avg_yellow_cards": self._team_stat_avg(results, "yellow_cards", "for"),
-            "avg_fouls": self._team_stat_avg(results, "fouls", "for"),
-            "avg_xgot_for": self._team_stat_avg(results, "xgot", "for"),
-            "avg_xgot_against": self._team_stat_avg(results, "xgot", "against"),
-            "avg_goals_prevented": self._team_stat_avg(results, "goals_prevented", "for"),
-            "avg_shots_for": self._team_stat_avg(results, "shots", "for"),
-            "avg_shots_against": self._team_stat_avg(results, "shots", "against"),
-            "avg_sot_for": self._team_stat_avg(results, "shots_on_target", "for"),
-            "avg_sot_against": self._team_stat_avg(results, "shots_on_target", "against"),
-            "avg_possession": self._team_stat_avg(results, "possession", "for"),
+            "avg_corners_for": self._team_stat_avg(results, "corners", team_id, "for"),
+            "avg_corners_against": self._team_stat_avg(results, "corners", team_id, "against"),
+            "avg_big_chances_for": self._team_stat_avg(results, "big_chances", team_id, "for"),
+            "avg_big_chances_against": self._team_stat_avg(results, "big_chances", team_id, "against"),
+            "avg_yellow_cards": self._team_stat_avg(results, "yellow_cards", team_id, "for"),
+            "avg_fouls": self._team_stat_avg(results, "fouls", team_id, "for"),
+            "avg_xgot_for": self._team_stat_avg(results, "xgot", team_id, "for"),
+            "avg_xgot_against": self._team_stat_avg(results, "xgot", team_id, "against"),
+            "avg_goals_prevented": self._team_stat_avg(results, "goals_prevented", team_id, "for"),
+            "avg_shots_for": self._team_stat_avg(results, "shots", team_id, "for"),
+            "avg_shots_against": self._team_stat_avg(results, "shots", team_id, "against"),
+            "avg_sot_for": self._team_stat_avg(results, "shots_on_target", team_id, "for"),
+            "avg_sot_against": self._team_stat_avg(results, "shots_on_target", team_id, "against"),
+            "avg_possession": self._team_stat_avg(results, "possession", team_id, "for"),
         })
 
         return {
             "team": stats["team"],
-            "matches": matches,
+            "matches": [m["id"] for m in recent],
             "results": results,
-            "stats": stats
+            "stats": stats,
         }
+
+    # ---------------- TELEGRAM ----------------
+    def send_telegram_message(self, message, bot_token, chat_id):
+        try:
+            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            payload = {
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "Markdown",
+            }
+            r = requests.post(url, data=payload, timeout=20)
+            if r.status_code != 200:
+                log.warning(f"Telegram error: {r.text}")
+        except Exception as e:
+            log.error(f"Failed to send Telegram message: {e}")
 
     def close(self):
         try:
@@ -1293,13 +801,14 @@ class FlashscoreGoalsScraper:
 # equally effective.
 HARD_TIMEOUT_DEFAULT_SEC = int(os.getenv("SCRAPER_HARD_TIMEOUT_DEFAULT_SEC", "90"))
 
-# analyze_team can involve up to 6 match-fetches internally (each up to
-# NAV_TIMEOUT_MS + STATS_TAB_TIMEOUT_MS if every inner Playwright
-# timeout fires cleanly, i.e. nothing is actually hung) plus one
-# discover_matches call — legitimate worst case is roughly
-# 6*(45+8) + 60 =~ 378s. This sits comfortably above that and
-# comfortably below the ~1200s pathological floor measured against the
-# live site.
+# analyze_team involves one get_team_recent_matches call (bounded by
+# DISCOVER_TIME_BUDGET_SEC) plus up to 6 get_match_statistics calls
+# (each an _api_get bounded by NAV_TIMEOUT_MS if its AbortController
+# fires cleanly, i.e. nothing is actually hung) — legitimate worst case
+# is roughly 60 + 6*45 =~ 330s. Left at the same 480s this was
+# originally set to against Flashscore's DOM-hang investigation, which
+# still gives real margin above that estimate; can likely come down
+# once this has run at scale against the API and shown typical timings.
 HARD_TIMEOUT_ANALYZE_TEAM_SEC = int(
     os.getenv("SCRAPER_HARD_TIMEOUT_ANALYZE_TEAM_SEC", "480")
 )
@@ -1337,7 +846,7 @@ def _scraper_worker_main(cmd_queue, result_queue, headless):
 
     scraper = None
     try:
-        scraper = FlashscoreGoalsScraper(headless=headless)
+        scraper = SofascoreGoalsScraper(headless=headless)
         while True:
             item = cmd_queue.get()
             if item is None or item[0] == "__stop__":
@@ -1363,7 +872,7 @@ def _scraper_worker_main(cmd_queue, result_queue, headless):
 
 class RemoteScraperHandle:
     """
-    Parent-side stand-in for FlashscoreGoalsScraper: every method call
+    Parent-side stand-in for SofascoreGoalsScraper: every method call
     is transparently forwarded (via __getattr__) to a persistent
     worker subprocess that actually owns the browser, with a hard,
     OS-enforced timeout on each call. If the worker doesn't respond in
@@ -1449,8 +958,8 @@ class RemoteScraperHandle:
     def __getattr__(self, name):
         # Anything not found as a real attribute on this handle is
         # treated as a proxied call on the worker's
-        # FlashscoreGoalsScraper — so every existing call site that
-        # used to call a FlashscoreGoalsScraper method directly
+        # SofascoreGoalsScraper — so every existing call site that
+        # used to call a SofascoreGoalsScraper method directly
         # (scraper.analyze_team(...), scraper.discover_matches(...),
         # etc.) keeps working completely unchanged.
         def _proxy(*args, **kwargs):
@@ -1474,9 +983,12 @@ class RemoteScraperHandle:
 # (2-0, 3-0, 3-1, 4-1, 4-2, ...). This is not a general betting-markets
 # engine — every other market from earlier iterations (draw, away win,
 # double chance, handicap, totals, corners/cards O/U, BTTS, clean
-# sheet, shots O/U, combos) has been removed. All the stats scraped by
-# FlashscoreGoalsScraper are still gathered the same way; this just
-# uses them narrowly, for one question.
+# sheet, shots O/U, combos) has been removed. All the stats gathered by
+# SofascoreGoalsScraper are still collected the same way; this just
+# uses them narrowly, for one question. This whole section is
+# site-agnostic — it only ever reads the abstract stats dict shape
+# analyze_team produces, never anything Sofascore- or Flashscore-
+# specific, so none of it needed to change when the scraper migrated.
 #
 # NOTE ON CONFIDENCE: every threshold below is a heuristic cutoff, not
 # a measured probability — nothing here has been validated against
@@ -2665,14 +2177,6 @@ def main():
         ""
     ).strip()
 
-    # .com, not .co.za — confirmed by direct testing that .co.za
-    # specifically stalls the stats-tab fetch for 480-1231+ seconds on
-    # matches where the identical match ID resolves on .com in ~2.6s.
-    # See _abs_url's comment for the full explanation.
-    FIXTURES_URL = (
-        "https://www.flashscore.com/"
-    )
-
     HEADLESS = True
 
     if not BOT_TOKEN or not CHAT_ID:
@@ -2694,78 +2198,54 @@ def main():
         CHAT_ID
     )
 
-    log.info("Starting Flashscore alert script...")
+    log.info("Starting Sofascore alert script...")
     log.info(f"Batch start={START}, limit={LIMIT}")
 
     # Declared before the try block so `finally` can safely check it even
     # if construction itself fails (see below).
     #
-    # HISTORY: this used to run home/away team analysis concurrently in
-    # two separate threads (each briefly a brand-new
-    # FlashscoreGoalsScraper — a full Chromium launch — per match; up to
-    # ~200 launches in a 100-match batch), then a persistent-worker-per-
-    # side version of the same concurrency (2 long-lived browsers). Both
-    # were followed by a run where individual 8s-budgeted operations
-    # took 150-1200+ seconds, on and off, even after the persistent-
-    # worker version proved (via _log_resource_usage) that process count
-    # and memory were staying flat — ruling out a resource leak as the
-    # cause of those stalls. The remaining suspect was CPU contention
-    # between multiple concurrently-rendering Chromium instances (2-3
-    # browsers on one host). That version removed that variable
-    # entirely (ONE browser, ONE scraper, sequential) and proved
-    # contention wasn't the cause either — the same ~1231s stalls
-    # reproduced with a single, uncontended browser. That pointed below
-    # Playwright's own `timeout=` kwarg entirely (most likely a
-    # silently-dropped TCP connection sitting until the OS's own
-    # retransmission timeout fires), which a plain in-process retry
-    # can't do anything about.
+    # HISTORY: this used to scrape Flashscore's DOM. That fought a
+    # stats "tab" that sometimes silently hung for 480-1231+ seconds
+    # with no error — reproduced across three Flashscore domains, and
+    # with or without concurrent browsers, ruling out both a resource
+    # leak and CPU contention as the cause. Migrated to Sofascore's own
+    # internal JSON API instead (see SofascoreGoalsScraper's docstring)
+    # — no DOM clicks, no "tab" to hang on, just plain HTTP GETs with a
+    # real client-side timeout that actually cancels a stuck request.
     #
-    # Current version: `scraper` is a RemoteScraperHandle, not a
-    # FlashscoreGoalsScraper directly — every method call below is
-    # transparently forwarded to a persistent worker SUBPROCESS that
-    # actually owns the one browser (see RemoteScraperHandle /
-    # _scraper_worker_main). Concurrency is still exactly one: nothing
-    # here runs two workers at once. The difference is that a call
-    # which exceeds a hard ceiling now gets its worker's entire process
-    # group SIGKILLed and replaced with a fresh one — a real OS-level
-    # kill a thread-based approach can't provide, since Playwright's
-    # sync API can't be called across threads at all (see the
-    # SUBPROCESS WATCHDOG comment above RemoteScraperHandle for why
+    # `scraper` is a RemoteScraperHandle, not a SofascoreGoalsScraper
+    # directly — every method call below is transparently forwarded to
+    # a persistent worker SUBPROCESS that actually owns the one browser
+    # session (see RemoteScraperHandle / _scraper_worker_main).
+    # Concurrency is still exactly one: nothing here runs two workers
+    # at once. A call that exceeds its hard ceiling gets its worker's
+    # entire process group SIGKILLed and replaced with a fresh one — a
+    # real OS-level kill a thread-based approach can't provide, since
+    # Playwright's sync API can't be called across threads at all (see
+    # the SUBPROCESS WATCHDOG comment above RemoteScraperHandle for why
     # that was tried and reverted).
     scraper = None
 
     try:
         # Spawning the worker (which itself launches Playwright +
-        # Chromium) is now INSIDE the try block. Previously this
-        # happened before the try, so any launch failure (missing
-        # browser binaries, missing OS deps, sandbox restrictions when
-        # run as root under cron, etc.) crashed the whole process with
-        # no "❌ Job FAILED" alert and no cleanup — you'd only ever see
-        # the "🚀 Job STARTED" message.
+        # Chromium and establishes a Sofascore session) is now INSIDE
+        # the try block. Previously this happened before the try, so
+        # any launch failure (missing browser binaries, missing OS
+        # deps, sandbox restrictions when run as root under cron, etc.)
+        # crashed the whole process with no "❌ Job FAILED" alert and no
+        # cleanup — you'd only ever see the "🚀 Job STARTED" message.
         scraper = RemoteScraperHandle(headless=HEADLESS)
 
         _log_resource_usage("job start, after worker spawn")
-
-        log.info(f"Opening fixtures page: {FIXTURES_URL}")
-
-        scraper._timed_goto(
-            FIXTURES_URL,
-            wait_until="load",
-            timeout=NAV_TIMEOUT_MS
-        )
-
-        scraper._wait_ready("a[href*='/match/']")
-        scraper._check_bot_challenge("fixtures page")
-        scraper.accept_cookies()
 
         matches = scraper.discover_matches(
             TARGET_COUNT,
             # Only fixtures that haven't kicked off yet — no point
             # spending a full analysis on a match that's already live
-            # or finished (see _is_match_upcoming). Left False (default)
-            # everywhere else discover_matches is called — e.g. inside
-            # analyze_team, pulling a team's past 6 results, which are
-            # *supposed* to already be finished.
+            # or finished. Left False (default) everywhere else
+            # discover_matches is called — e.g. inside analyze_team,
+            # pulling a team's past 6 results, which are *supposed* to
+            # already be finished.
             only_upcoming=True
         )
 
@@ -2793,49 +2273,47 @@ def main():
 
             return
 
-        for idx, m_url in enumerate(
+        for idx, match in enumerate(
             batch_matches,
             start=START + 1
         ):
 
-            log.info(f"Processing match {idx}: {m_url}")
+            # discover_matches already returns rich dicts (home/away
+            # names AND exact IDs, tournament) straight from Sofascore's
+            # API — unlike the Flashscore version, there's no separate
+            # "visit the match page to read team names/links" step
+            # needed at all.
+            m_url = f"https://www.sofascore.com/event/{match['id']}"
+            home = match["home_name"]
+            away = match["away_name"]
+
+            log.info(
+                f"Processing match {idx}: {home} vs {away} "
+                f"({match.get('tournament', '')}) {m_url}"
+            )
 
             try:
-                fixture = (
-                    scraper.get_match_teams_and_links(
-                        m_url
-                    )
-                )
-
-                if (
-                    not fixture
-                    or not fixture["home_name"]
-                    or not fixture["away_name"]
-                ):
-
+                if not home or not away:
                     log.warning(
                         "Could not extract teams, skipping match"
                     )
-
                     continue
 
-                home = fixture["home_name"]
-                away = fixture["away_name"]
-
-                # Sequential now, both through the single `scraper` —
-                # see the note above `scraper = FlashscoreGoalsScraper
-                # (...)` for why. maybe_recycle_browser is the periodic
+                # Sequential, both through the single `scraper` — see
+                # the note above `scraper = RemoteScraperHandle(...)`
+                # for why. maybe_recycle_browser is the periodic
                 # full-relaunch safety net; new_session gives each
-                # team's analysis a clean context (no cookie/session
-                # carryover) without paying for a full relaunch to get
-                # it.
+                # team's analysis a clean session (no cookie carryover)
+                # without paying for a full relaunch to get it.
                 home_error = None
                 away_error = None
 
                 try:
                     scraper.maybe_recycle_browser()
                     scraper.new_session()
-                    home_data = scraper.analyze_team(fixture["home_url"])
+                    home_data = scraper.analyze_team(
+                        match["home_id"], match["home_name"]
+                    )
                 except Exception as e:
                     home_data = None
                     home_error = e
@@ -2843,7 +2321,9 @@ def main():
                 try:
                     scraper.maybe_recycle_browser()
                     scraper.new_session()
-                    away_data = scraper.analyze_team(fixture["away_url"])
+                    away_data = scraper.analyze_team(
+                        match["away_id"], match["away_name"]
+                    )
                 except Exception as e:
                     away_data = None
                     away_error = e
