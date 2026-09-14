@@ -3,16 +3,9 @@ import sys
 import argparse
 import json
 import logging
-import multiprocessing
-import queue
-import signal
-import traceback
-from playwright.sync_api import sync_playwright
-from urllib.parse import urlparse
-from difflib import SequenceMatcher
 import time
 import re
-import unicodedata
+import traceback
 import requests
 
 
@@ -33,134 +26,47 @@ logging.basicConfig(
 log = logging.getLogger("flashscore")
 
 
-# ---------------- DIAGNOSTIC / FAIL-FAST TUNABLES ----------------
-# This scraper originally targeted Flashscore's DOM and chased a "this
-# got much slower all of a sudden" regression there for most of a day:
-# navigations pinned at a flat 90s timeout with zero timing/visibility,
+# ---------------- TUNABLES ----------------
+# HISTORY: this scraper went through two prior incarnations before
+# this one. Flashscore's DOM: navigations pinned at a flat 90s timeout,
 # a stats "tab" click that sometimes silently hung for 480-1231+
-# seconds with no error (reproduced across three Flashscore domains,
-# with and without concurrent browsers — never resolved). Migrated to
-# Sofascore's internal JSON API instead (see SofascoreGoalsScraper's
-# docstring), which sidesteps that whole class of problem — no DOM
-# clicks, no tab to hang on. These tunables are what's left of that
-# investigation's fail-fast infrastructure, still useful for the one
-# real navigation (establishing a session) and the API-call timeouts.
+# seconds with no error, reproduced across three Flashscore domains,
+# with and without concurrent browsers — never resolved. Then
+# Sofascore's internal JSON API via a Playwright-established browser
+# session (bare `requests` calls were blocked, 403, but fetch() from
+# inside a real page succeeded) — fast and reliable in every local
+# test, but blocked outright (instant 403, edge/WAF-level, not
+# fingerprint-based) from GitHub Actions' datacenter IP range,
+# something no amount of in-page trickery can route around.
 #
-# Lower this to fail faster once you've confirmed something is
-# genuinely hanging rather than just slow; raise it back if you start
-# seeing false-negative timeouts on a healthy-but-slow connection.
-NAV_TIMEOUT_MS = int(os.getenv("SCRAPER_NAV_TIMEOUT_MS", "45000"))
+# This version targets 365scores.com instead, whose equivalent API
+# (webws.365scores.com/web/...) answers plain, unauthenticated
+# `requests.get()` calls directly — confirmed by direct testing, no
+# browser, no session, no fingerprinting needed at all. That means no
+# Playwright, no subprocess watchdog, no browser-recycling, none of
+# the machinery the prior two versions needed — a stuck HTTP request
+# with requests' own `timeout=` genuinely aborts at the socket level,
+# which was never reliably true of Playwright's `timeout=` against
+# whatever was actually happening with Flashscore. Whether 365scores'
+# API is *also* reachable from GitHub Actions' IP range specifically
+# is the one thing that couldn't be verified in advance (no way to
+# execute this from a GH Actions runner directly) — the real answer
+# comes from running this for real.
+REQUEST_TIMEOUT_SEC = int(os.getenv("SCRAPER_REQUEST_TIMEOUT_SEC", "20"))
+
+# A transient 5xx (seen once, live: a 504 that succeeded on the very
+# next attempt) shouldn't sink an otherwise-good match/team — retried
+# with a short pause, not the full kill-and-respawn machinery the
+# Playwright-based versions needed for a fundamentally different
+# failure mode (a hung request, not a bounce-back error response).
+MAX_RETRIES = int(os.getenv("SCRAPER_MAX_RETRIES", "3"))
+RETRY_BACKOFF_SEC = float(os.getenv("SCRAPER_RETRY_BACKOFF_SEC", "1.5"))
 
 # Hard ceiling on how long discover_matches / get_team_recent_matches
-# are allowed to spend paginating through Sofascore's API for one
-# team/date, on top of their own page-count caps. Without this, an
-# API response shape change could spin through many pages indefinitely.
+# are allowed to spend paginating the API for one team/date, on top of
+# their own page-count caps. Without this, an API response shape
+# change could spin through many pages indefinitely.
 DISCOVER_TIME_BUDGET_SEC = int(os.getenv("SCRAPER_DISCOVER_BUDGET_SEC", "60"))
-
-# How many analyze_team() calls a single browser process handles
-# before SofascoreGoalsScraper.maybe_recycle_browser() closes and
-# relaunches it. See maybe_recycle_browser's docstring for the
-# investigation that motivated this — was previously implicitly "1"
-# (a fresh browser process per team, per match), which is what led
-# to the resource exhaustion this whole mechanism replaces.
-BROWSER_RECYCLE_EVERY = int(os.getenv("SCRAPER_BROWSER_RECYCLE_EVERY", "40"))
-
-# Title substrings seen on common bot-mitigation interstitials
-# (Cloudflare, DataDome, generic "checking your browser" pages). Only
-# relevant to the one real page load per session (establishing
-# cookies/fingerprint before any API fetch) — if that page shows one
-# of these instead of the real Sofascore homepage, that's a strong
-# signal we're being challenged rather than just experiencing normal
-# latency.
-BOT_CHALLENGE_MARKERS = (
-    "just a moment",
-    "checking your browser",
-    "attention required",
-    "verify you are human",
-    "access denied",
-    "are you a robot",
-)
-
-
-# ---------------- RESOURCE DIAGNOSTICS ----------------
-def _log_resource_usage(label):
-    # Diagnostic-only, deliberately dependency-free: reads straight
-    # from /proc rather than pulling in psutil (not in requirements.txt,
-    # and it turned out to be broken in this environment anyway) —
-    # /proc is standard on every Linux runner this script actually runs
-    # on. Added to confirm/rule out a suspected leak: each match spins
-    # up two brand-new Chromium browser processes (home/away threads)
-    # and closes them after, and a run that starts fast (~1min/match)
-    # then falls off a cliff into multi-minute stalls partway through
-    # looks a lot like those processes/memory not being fully reclaimed
-    # and the host progressively starving under the accumulated load.
-    # Fails soft — never let a diagnostic break the actual scrape.
-    try:
-        chrome_procs = 0
-        for pid in os.listdir("/proc"):
-            if not pid.isdigit():
-                continue
-            try:
-                with open(f"/proc/{pid}/comm") as f:
-                    comm = f.read().strip()
-                if "chrom" in comm.lower():
-                    chrome_procs += 1
-            except Exception:
-                continue
-
-        mem_available_kb = None
-        mem_total_kb = None
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    mem_available_kb = int(line.split()[1])
-                elif line.startswith("MemTotal:"):
-                    mem_total_kb = int(line.split()[1])
-
-        if mem_available_kb is not None and mem_total_kb is not None:
-            mem_str = (
-                f"{mem_available_kb / 1024:.0f}MB free / "
-                f"{mem_total_kb / 1024:.0f}MB total"
-            )
-        else:
-            mem_str = "unknown"
-
-        log.info(
-            f"[resources @ {label}] chrome-family processes="
-            f"{chrome_procs}, memory={mem_str}"
-        )
-    except Exception as e:
-        log.debug(f"resource logging failed: {e}")
-
-
-# ---------------- REQUEST BLOCKING ----------------
-# Resource types this scraper never needs — it only ever reads text/DOM
-# state (team names, scores, stat table values), never anything visual.
-# Blocking these cuts page weight and JS/rendering cost substantially,
-# which matters a lot with 3 browser instances (fixtures walker + home
-# worker + away worker) potentially rendering concurrently — a run
-# showed individual 8s-budgeted operations occasionally taking 150-1200+
-# seconds, well past what a slow-but-working page load explains, more
-# consistent with host CPU contention from heavy pages (ads, trackers,
-# video widgets) than with anything else.
-#
-# Deliberately NOT blocking stylesheets or scripts: _wait_ready's
-# state="visible" checks depend on CSS layout, and Flashscore's own
-# content (team names, live stats) is client-side rendered via JS, so
-# either would break the actual scraping, not just slim it down.
-BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
-
-
-def _block_heavy_resources(route):
-    try:
-        if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
-            route.abort()
-        else:
-            route.continue_()
-    except Exception:
-        # A route that's already been handled/the page navigated away
-        # mid-request raises here — never let that break the load.
-        pass
 
 
 # ---------------- JOB STATUS TELEGRAM ----------------
@@ -174,313 +80,186 @@ def send_job_status(message, bot_token, chat_id):
 
 
 # ---------------- SCRAPER CLASS ----------------
-class SofascoreGoalsScraper:
+class SixtyFiveScoresScraper:
     """
-    Talks to Sofascore's own internal JSON API (the same one their React
-    app calls) rather than DOM-scraping. Playwright is only used to
-    establish one legitimate browser session (a real page load gives us
-    real cookies/fingerprint) — every actual data fetch after that goes
-    through page.evaluate()-executed fetch() calls against
-    www.sofascore.com/api/v1/..., which returns clean structured JSON.
+    Talks directly to 365scores.com's own internal JSON API
+    (webws.365scores.com/web/...) with plain requests calls — no
+    browser, no session establishment, no fingerprinting needed. See
+    this module's TUNABLES comment for why (and what this replaces).
 
-    This matters because a bare `requests.get()` to these same endpoints
-    is blocked outright (403), even with a spoofed browser User-Agent —
-    confirmed by direct testing — but the identical request made from
-    inside an actual loaded page succeeds cleanly. Real bot protection
-    exists at the API layer, keyed to session/fingerprint, not headers
-    alone.
-
-    This also sidesteps the entire class of problem a prior Flashscore-
-    based version of this scraper fought for most of a day: DOM click
-    races, a stats "tab" that sometimes silently hung for 480-1231+
-    seconds with no error (reproduced across three Flashscore domains,
-    with and without concurrent browsers — never resolved), and
-    fragile CSS selectors. There's no tab to click here — every value
-    is a plain HTTP GET with a real AbortController timeout, so a stuck
-    request fails cleanly and fast instead of hanging indefinitely.
+    Every endpoint used here was found by watching what the real
+    365scores.com website itself calls while browsing it (network
+    inspection via a real, one-off Playwright session used only for
+    that investigation, not part of this class), then confirmed
+    directly against plain `requests.get()` calls — not guessed.
     """
 
-    def __init__(self, headless=True):
-        self.headless = headless
-        self.playwright = sync_playwright().start()
-        self.browser = None
-        self.context = None
-        self.page = None
-        self._session_count = 0
-        self._launch_browser()
+    BASE_URL = "https://webws.365scores.com/web"
+
+    # Required on every call — this is what the site's own frontend
+    # always sends; a couple of these (timezoneName, userCountryId)
+    # look like they affect response localization/ordering, not
+    # authorization, but they're included as-is since that's what a
+    # real request looks like.
+    COMMON_PARAMS = {
+        "appTypeId": 5,
+        "langId": 10,
+        "timezoneName": "Africa/Johannesburg",
+        "userCountryId": 134,
+    }
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/134.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json",
+        })
         self.team_id = None
         self.team_name = None
 
-    def _new_context(self):
-        # Factored out so both _launch_browser and new_session (below)
-        # create contexts with identical settings, and both establish a
-        # fresh legitimate session via one real page load before any
-        # API fetch is attempted through it.
-        self.context = self.browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
-            ),
+    def _api_get(self, path, params=None, max_retries=None):
+        """
+        GET https://webws.365scores.com/web/{path} with COMMON_PARAMS
+        plus whatever's passed in `params`, retrying transient
+        failures (connection errors, timeouts, 5xx) up to max_retries
+        times with a short pause between attempts. Returns the parsed
+        JSON body, or None (logged) if every attempt fails or the
+        response isn't valid JSON.
+        """
+        if max_retries is None:
+            max_retries = MAX_RETRIES
+
+        url = f"{self.BASE_URL}/{path}"
+        full_params = dict(self.COMMON_PARAMS)
+        if params:
+            full_params.update(params)
+
+        last_error = None
+
+        for attempt in range(1, max_retries + 1):
+            t0 = time.time()
+            try:
+                r = self.session.get(
+                    url, params=full_params, timeout=REQUEST_TIMEOUT_SEC
+                )
+            except Exception as e:
+                last_error = f"request error: {e}"
+                log.warning(
+                    f"API GET {url} attempt {attempt}/{max_retries} "
+                    f"failed after {time.time()-t0:.1f}s: {last_error}"
+                )
+                if attempt < max_retries:
+                    time.sleep(RETRY_BACKOFF_SEC)
+                continue
+
+            if r.status_code >= 500:
+                last_error = f"status={r.status_code}"
+                log.warning(
+                    f"API GET {url} attempt {attempt}/{max_retries} "
+                    f"got {r.status_code} after {time.time()-t0:.1f}s "
+                    f"(transient server error, retrying)"
+                )
+                if attempt < max_retries:
+                    time.sleep(RETRY_BACKOFF_SEC)
+                continue
+
+            if r.status_code != 200:
+                # A 4xx (403, 404, ...) won't fix itself on retry —
+                # this is where a real IP/access block would show up.
+                log.warning(
+                    f"API GET {url} failed after {time.time()-t0:.1f}s: "
+                    f"status={r.status_code} body={r.text[:200]!r}"
+                )
+                return None
+
+            try:
+                return r.json()
+            except Exception as e:
+                log.warning(
+                    f"API GET {url} returned invalid JSON after "
+                    f"{time.time()-t0:.1f}s: {e}"
+                )
+                return None
+
+        log.warning(
+            f"API GET {url} exhausted {max_retries} attempts, "
+            f"last error: {last_error}"
         )
-        self.context.route("**/*", _block_heavy_resources)
-        self.page = self.context.new_page()
-        self._establish_session()
-
-    def _establish_session(self):
-        try:
-            self.page.goto(
-                "https://www.sofascore.com/",
-                wait_until="domcontentloaded",
-                timeout=NAV_TIMEOUT_MS,
-            )
-            self._check_bot_challenge("session establishment")
-        except Exception as e:
-            log.warning(f"Failed to establish Sofascore session: {e}")
-
-    def _launch_browser(self):
-        # --no-sandbox / --disable-dev-shm-usage are required in most
-        # scheduler contexts: cron/systemd jobs often run as root (where
-        # Chromium's sandbox refuses to start without --no-sandbox) or
-        # in containers with a tiny /dev/shm.
-        self.browser = self.playwright.chromium.launch(
-            headless=self.headless,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ],
-        )
-        self._new_context()
-        self._session_count = 0
-
-    def new_session(self):
-        """
-        Closes the current context and opens a fresh one (new cookies,
-        new session) on the SAME browser process. Call this between
-        logical units of work (e.g. once per team, before analyze_team)
-        that need isolation from each other.
-        """
-        try:
-            if self.context is not None:
-                self.context.close()
-        except Exception as e:
-            log.warning(f"Error closing context for new session: {e}")
-
-        self._new_context()
-
-    def maybe_recycle_browser(self):
-        # Periodic full relaunch as a safety net against any slow
-        # leak inside a single very-long-lived Chromium process — see
-        # BROWSER_RECYCLE_EVERY's comment.
-        self._session_count += 1
-
-        if self._session_count < BROWSER_RECYCLE_EVERY:
-            return
-
-        log.info(
-            f"Recycling browser after {self._session_count} team "
-            f"analyses (SCRAPER_BROWSER_RECYCLE_EVERY="
-            f"{BROWSER_RECYCLE_EVERY})"
-        )
-
-        try:
-            self.context.close()
-        except Exception as e:
-            log.warning(f"Error closing context during recycle: {e}")
-
-        try:
-            self.browser.close()
-        except Exception as e:
-            log.warning(f"Error closing browser during recycle: {e}")
-
-        self._launch_browser()
-
-    def _check_bot_challenge(self, context_label=""):
-        try:
-            title = (self.page.title() or "").strip()
-        except Exception:
-            return False
-
-        if any(marker in title.lower() for marker in BOT_CHALLENGE_MARKERS):
-            log.warning(
-                f"POSSIBLE BOT CHALLENGE"
-                f"{' (' + context_label + ')' if context_label else ''}: "
-                f"page title={title!r} url={self.page.url!r}"
-            )
-            return True
-
-        return False
-
-    def _api_get(self, path, timeout_ms=None):
-        """
-        Fetches a Sofascore API path via the browser's own fetch(),
-        using its already-established session/cookies — see the class
-        docstring for why a bare requests.get() to these same paths is
-        blocked (403) while this isn't. Uses a real AbortController on
-        the JS side so a stuck request is genuinely cancelled at the
-        network layer after timeout_ms, not just abandoned by our own
-        code while the underlying fetch keeps running.
-
-        Returns the parsed JSON body, or None (logged) on any failure:
-        network error, timeout, non-2xx status, or invalid JSON.
-        """
-        if timeout_ms is None:
-            timeout_ms = NAV_TIMEOUT_MS
-
-        t0 = time.time()
-        try:
-            result = self.page.evaluate(
-                """async ({ path, timeoutMs }) => {
-                    const controller = new AbortController();
-                    const timer = setTimeout(() => controller.abort(), timeoutMs);
-                    try {
-                        const r = await fetch(path, {
-                            headers: { 'Accept': 'application/json' },
-                            signal: controller.signal,
-                        });
-                        const text = await r.text();
-                        return { ok: r.ok, status: r.status, text: text };
-                    } catch (e) {
-                        return { ok: false, status: 0, text: String(e) };
-                    } finally {
-                        clearTimeout(timer);
-                    }
-                }""",
-                {"path": path, "timeoutMs": timeout_ms},
-            )
-        except Exception as e:
-            log.warning(
-                f"API GET {path} evaluate() failed after "
-                f"{time.time()-t0:.1f}s: {e}"
-            )
-            return None
-
-        elapsed = time.time() - t0
-
-        if not result or not result.get("ok"):
-            log.warning(
-                f"API GET {path} failed after {elapsed:.1f}s: "
-                f"status={result.get('status') if result else '?'} "
-                f"body={str(result.get('text') if result else '')[:200]!r}"
-            )
-            return None
-
-        try:
-            return json.loads(result["text"])
-        except Exception as e:
-            log.warning(
-                f"API GET {path} returned invalid JSON after "
-                f"{elapsed:.1f}s: {e}"
-            )
-            return None
+        return None
 
     # ---------------- DISCOVERY ----------------
-    def discover_matches(
-        self, target_count, date_str=None, only_upcoming=False,
-        max_tournaments=300
-    ):
+    def discover_matches(self, target_count, date_str=None, only_upcoming=False):
         """
         Returns up to `target_count` match dicts for `date_str`
-        (today, server-local, if not given): each
+        (today, server-local, if not given, as DD/MM/YYYY — what the
+        API expects): each
         {id, home_id, home_name, away_id, away_name, tournament}.
 
-        Scans every tournament playing that date (paginating
-        scheduled-tournaments -> scheduled-events per tournament) until
-        target_count is reached or tournaments run out. When
-        only_upcoming is True, skips anything whose status isn't
-        "notstarted" — no point predicting on a match that's already
-        live or finished.
+        A single games/allscores call already returns every match
+        across every competition for the given date (163 on the day
+        this was tested) — no per-tournament pagination needed, unlike
+        the Sofascore version. When only_upcoming is True, skips
+        anything not in statusGroup 2 (scheduled/not started) — 4 is
+        finished, confirmed by direct inspection.
         """
         if date_str is None:
-            date_str = time.strftime("%Y-%m-%d")
+            date_str = time.strftime("%d/%m/%Y")
+
+        t0 = time.time()
+        data = self._api_get(
+            "games/allscores/",
+            params={
+                "sports": 1,
+                "startDate": date_str,
+                "endDate": date_str,
+                "showOdds": "true",
+                "onlyMajorGames": "false",
+                "withTop": "true",
+            },
+        )
 
         matches = []
-        seen_ids = set()
         skipped_not_upcoming = 0
-        tournament_page = 1
-        tournaments_scanned = 0
-        t0 = time.time()
 
-        while len(matches) < target_count and tournaments_scanned < max_tournaments:
-            if time.time() - t0 > DISCOVER_TIME_BUDGET_SEC:
-                log.warning(
-                    f"discover_matches hit its {DISCOVER_TIME_BUDGET_SEC}s "
-                    f"time budget after scanning {tournaments_scanned} "
-                    f"tournaments, {len(matches)}/{target_count} found "
-                    f"— stopping early"
-                )
-                break
+        if data and data.get("games"):
+            for g in data["games"]:
+                if time.time() - t0 > DISCOVER_TIME_BUDGET_SEC:
+                    log.warning(
+                        f"discover_matches hit its "
+                        f"{DISCOVER_TIME_BUDGET_SEC}s time budget with "
+                        f"{len(matches)}/{target_count} found — "
+                        f"stopping early"
+                    )
+                    break
 
-            page_data = self._api_get(
-                f"/api/v1/sport/football/scheduled-tournaments/"
-                f"{date_str}/page/{tournament_page}"
-            )
-            if not page_data or not page_data.get("scheduled"):
-                break
-
-            tournament_ids = []
-            for entry in page_data["scheduled"]:
-                # uniqueTournament is nested inside tournament here, not
-                # a sibling of it — confirmed by direct inspection, not
-                # assumption (an earlier raw single-line JSON slice was
-                # misleading about the actual nesting depth).
-                tournament = entry.get("tournament") or {}
-                ut = tournament.get("uniqueTournament") or {}
-                ut_id = ut.get("id")
-                if ut_id is not None:
-                    tournament_ids.append(ut_id)
-
-            for ut_id in tournament_ids:
                 if len(matches) >= target_count:
                     break
-                if time.time() - t0 > DISCOVER_TIME_BUDGET_SEC:
-                    break
 
-                tournaments_scanned += 1
-                events_data = self._api_get(
-                    f"/api/v1/unique-tournament/{ut_id}/scheduled-events/{date_str}"
-                )
-                if not events_data or not events_data.get("events"):
+                if only_upcoming and g.get("statusGroup") != 2:
+                    skipped_not_upcoming += 1
                     continue
 
-                for e in events_data["events"]:
-                    eid = e.get("id")
-                    if eid is None or eid in seen_ids:
-                        continue
+                home = g.get("homeCompetitor") or {}
+                away = g.get("awayCompetitor") or {}
+                if home.get("id") is None or away.get("id") is None:
+                    continue
 
-                    status_type = (e.get("status") or {}).get("type")
-                    if only_upcoming and status_type != "notstarted":
-                        seen_ids.add(eid)
-                        skipped_not_upcoming += 1
-                        continue
-
-                    home = e.get("homeTeam") or {}
-                    away = e.get("awayTeam") or {}
-                    if home.get("id") is None or away.get("id") is None:
-                        continue
-
-                    matches.append({
-                        "id": eid,
-                        "home_id": home["id"],
-                        "home_name": home.get("name", ""),
-                        "away_id": away["id"],
-                        "away_name": away.get("name", ""),
-                        "tournament": (e.get("tournament") or {}).get("name", ""),
-                    })
-                    seen_ids.add(eid)
-
-                    if len(matches) >= target_count:
-                        break
-
-            if not page_data.get("hasNextPage"):
-                break
-            tournament_page += 1
+                matches.append({
+                    "id": g["id"],
+                    "home_id": home["id"],
+                    "home_name": home.get("name", ""),
+                    "away_id": away["id"],
+                    "away_name": away.get("name", ""),
+                    "tournament": g.get("competitionDisplayName", ""),
+                })
 
         log.info(
             f"discover_matches: found {len(matches)}/{target_count} "
-            f"across {tournaments_scanned} tournaments, "
-            f"{time.time()-t0:.1f}s"
+            f"for {date_str}, {time.time()-t0:.1f}s"
             + (
                 f", skipped {skipped_not_upcoming} already-started/finished"
                 if only_upcoming
@@ -490,122 +269,113 @@ class SofascoreGoalsScraper:
         return matches
 
     # ---------------- TEAM HISTORY ----------------
-    def get_team_recent_matches(self, team_id, count=6, max_pages=6):
+    def get_team_recent_matches(self, team_id, count=6):
         """
         Returns up to `count` of this team's most recent FINISHED
         matches, each a light dict (id, home_id, home_name, away_id,
-        away_name, home_goals, away_goals). Paginates
-        team/{id}/events/last/{page} since that endpoint can include
-        postponed/cancelled/awarded entries mixed in with genuinely
-        finished ones — filtered defensively by status.type.
+        away_name, home_goals, away_goals). games/results/ already
+        returns most-recent-first and only finished/awarded games —
+        confirmed by direct inspection (statusGroup 4 throughout,
+        startTime descending) — filtered by statusGroup defensively
+        anyway in case that ever includes something else.
         """
+        data = self._api_get(
+            "games/results/",
+            params={"competitors": team_id, "showOdds": "true"},
+        )
+
         results = []
-        seen_ids = set()
-        page = 0
-        t0 = time.time()
+        if not data or not data.get("games"):
+            return results
 
-        while len(results) < count and page < max_pages:
-            if time.time() - t0 > DISCOVER_TIME_BUDGET_SEC:
-                log.warning(
-                    f"get_team_recent_matches for team {team_id} hit its "
-                    f"{DISCOVER_TIME_BUDGET_SEC}s time budget with "
-                    f"{len(results)}/{count} found — stopping early"
-                )
+        for g in data["games"]:
+            if g.get("statusGroup") != 4:
+                continue
+
+            home = g.get("homeCompetitor") or {}
+            away = g.get("awayCompetitor") or {}
+            home_goals = home.get("score")
+            away_goals = away.get("score")
+
+            if home.get("id") is None or away.get("id") is None:
+                continue
+            if home_goals is None or away_goals is None:
+                continue
+
+            results.append({
+                "id": g["id"],
+                "home_id": home["id"],
+                "home_name": home.get("name", ""),
+                "away_id": away["id"],
+                "away_name": away.get("name", ""),
+                "home_goals": home_goals,
+                "away_goals": away_goals,
+            })
+
+            if len(results) >= count:
                 break
-
-            data = self._api_get(f"/api/v1/team/{team_id}/events/last/{page}")
-            if not data or not data.get("events"):
-                break
-
-            for e in data["events"]:
-                eid = e.get("id")
-                if eid is None or eid in seen_ids:
-                    continue
-                seen_ids.add(eid)
-
-                status_type = (e.get("status") or {}).get("type")
-                if status_type != "finished":
-                    continue
-
-                home = e.get("homeTeam") or {}
-                away = e.get("awayTeam") or {}
-                home_goals = (e.get("homeScore") or {}).get("current")
-                away_goals = (e.get("awayScore") or {}).get("current")
-
-                if home.get("id") is None or away.get("id") is None:
-                    continue
-                if home_goals is None or away_goals is None:
-                    continue
-
-                results.append({
-                    "id": eid,
-                    "home_id": home["id"],
-                    "home_name": home.get("name", ""),
-                    "away_id": away["id"],
-                    "away_name": away.get("name", ""),
-                    "home_goals": home_goals,
-                    "away_goals": away_goals,
-                })
-
-                if len(results) >= count:
-                    break
-
-            if not data.get("hasNextPage"):
-                break
-            page += 1
 
         return results
 
     # ---------------- MATCH STATISTICS ----------------
-    # Maps a Sofascore statistics-item's JSON `key` to the short name we
-    # store it under. Sofascore has no direct xGOT ("expected goals on
-    # target") or goalkeeper "goals prevented" (an xG-based derived
-    # stat) equivalent — goalkeeperSaves is a raw save count, a
-    # different thing — so avg_xgot_for/against and
-    # avg_goals_prevented stay None for Sofascore-sourced data. Every
-    # signal-evaluation function already treats those as optional
-    # (None-safe checks throughout), so this doesn't break anything —
-    # it just means those specific corroboration bonuses never fire.
-    STAT_KEY_MAP = {
-        "expectedGoals": "xg",
-        "totalShotsOnGoal": "shots",
-        "shotsOnGoal": "shots_on_target",
-        "cornerKicks": "corners",
-        "bigChanceCreated": "big_chances",
-        "yellowCards": "yellow_cards",
-        "fouls": "fouls",
-        "ballPossession": "possession",
+    # Maps a 365scores statistics-item's `name` to the short name we
+    # store it under. Richer than either prior source for major
+    # leagues — this is the only one of the three sites that had an
+    # "Expected Goals On Target" (xGOT) figure at all. Minor leagues
+    # (reserve/lower divisions) come back with a much smaller stat set
+    # (no xG-family fields at all) — every signal-evaluation function
+    # already treats every one of these as optional (None-safe checks
+    # throughout), so that just means fewer corroboration points are
+    # available for those matches, not a broken pipeline.
+    STAT_NAME_MAP = {
+        "Expected Goals": "xg",
+        "Expected Goals On Target": "xgot",
+        "Total Shots": "shots",
+        "Shots On Target": "shots_on_target",
+        "Corners": "corners",
+        "Big Chances Created": "big_chances",
+        "Yellow Cards": "yellow_cards",
+        "Fouls": "fouls",
+        "Possession": "possession",
     }
 
     def _empty_stat_result(self):
         result = {}
-        for stat_key in set(self.STAT_KEY_MAP.values()) | {"xgot", "goals_prevented"}:
+        for stat_key in set(self.STAT_NAME_MAP.values()) | {"goals_prevented"}:
             result[f"home_{stat_key}"] = None
             result[f"away_{stat_key}"] = None
         return result
 
-    def get_match_statistics(self, match_id):
+    def get_match_statistics(self, match_id, home_id, away_id):
+        """
+        Unlike Flashscore/Sofascore's stats payloads (already split
+        into home/away fields per stat), 365scores returns one flat
+        list of {name, competitorId, value} rows — one row per side
+        per stat — so home_id/away_id are needed here to know which
+        competitorId maps to which side.
+        """
         result = self._empty_stat_result()
 
-        data = self._api_get(f"/api/v1/event/{match_id}/statistics")
+        data = self._api_get("game/stats/", params={"games": match_id})
         if not data or not data.get("statistics"):
             return result
 
         try:
-            overall = data["statistics"][0]  # period == "ALL"
-            for group in overall.get("groups", []):
-                for item in group.get("statisticsItems", []):
-                    stat_name = self.STAT_KEY_MAP.get(item.get("key"))
-                    if not stat_name:
-                        continue
+            for item in data["statistics"]:
+                stat_name = self.STAT_NAME_MAP.get(item.get("name"))
+                if not stat_name:
+                    continue
 
-                    # Several keys (e.g. totalShotsOnGoal, totalTackle)
-                    # appear in more than one group with identical
-                    # values — keep the first occurrence only.
-                    if result.get(f"home_{stat_name}") is None:
-                        result[f"home_{stat_name}"] = item.get("homeValue")
-                    if result.get(f"away_{stat_name}") is None:
-                        result[f"away_{stat_name}"] = item.get("awayValue")
+                competitor_id = item.get("competitorId")
+                raw_value = item.get("value")
+                value = self._parse_stat_value(raw_value)
+                if value is None:
+                    continue
+
+                if competitor_id == home_id:
+                    result[f"home_{stat_name}"] = value
+                elif competitor_id == away_id:
+                    result[f"away_{stat_name}"] = value
         except Exception as e:
             log.warning(
                 f"Error parsing statistics for match {match_id}: {e}"
@@ -613,16 +383,25 @@ class SofascoreGoalsScraper:
 
         return result
 
+    def _parse_stat_value(self, raw_value):
+        # Values come back as strings, sometimes with a trailing '%'
+        # (e.g. "52%" for possession) — strip that and parse the
+        # leading number either way.
+        if raw_value is None:
+            return None
+        try:
+            return float(str(raw_value).rstrip("%"))
+        except (TypeError, ValueError):
+            return None
+
     # ---------------- STAT AVERAGING ----------------
     def _team_stat_avg(self, results, stat_name, team_id, side="for"):
         """
         Generic averager for every per-match stat (goals, xg, corners,
         cards, ...): side="for" -> team_id's own stat_name in each
         match; side="against" -> the opponent's. Matches by exact team
-        ID rather than the fuzzy name-aliasing a DOM-scraped version
-        would need (team_slug/team_label/normalize_name) — Sofascore's
-        IDs are unambiguous, so that whole apparatus is unnecessary
-        here.
+        ID — every source used here has unambiguous numeric IDs, no
+        fuzzy name-aliasing needed.
         """
         total = 0
         counted = 0
@@ -696,7 +475,9 @@ class SofascoreGoalsScraper:
         recent = self.get_team_recent_matches(team_id, count=6)
         results = []
         for m in recent:
-            match_stats = self.get_match_statistics(m["id"])
+            match_stats = self.get_match_statistics(
+                m["id"], m["home_id"], m["away_id"]
+            )
             match_data = dict(m)
             match_data.update(match_stats)
             results.append(match_data)
@@ -764,217 +545,9 @@ class SofascoreGoalsScraper:
 
     def close(self):
         try:
-            self.browser.close()
-            self.playwright.stop()
+            self.session.close()
         except Exception as e:
-            log.warning(f"Error while closing browser: {e}")
-
-
-# ---------------- SUBPROCESS WATCHDOG ----------------
-# Real hard-kill capability for the ~1200s stalls Playwright's own
-# `timeout=` parameter can't reach. Investigation found several
-# operations budgeted at 8s instead running ~1200-1231s, landing on
-# nearly the same duration across totally unrelated matches/leagues —
-# reproduced even with a single, uncontended browser — which points to
-# something beneath the layer Playwright's timeout kwarg controls
-# (most likely a TCP connection silently dropped in transit, sitting
-# until the OS's own retransmission timeout eventually gives up).
-#
-# A thread-based hard timeout was tried and reverted: Playwright's sync
-# API is thread-affine — calling a page/browser from any thread other
-# than the one that created it fails immediately ("Cannot switch to a
-# different thread"), regardless of whether anything is actually slow.
-# That would break every call, not just the slow ones. A genuinely
-# separate OS PROCESS has no such restriction and can be killed
-# unconditionally from outside, so the scraper now runs in a
-# persistent worker subprocess (see RemoteScraperHandle) instead of
-# directly in this process.
-#
-# Granularity is per RPC call (one whole analyze_team() call, one
-# discover_matches() call, ...), not per individual navigation inside
-# them. Finer-grained (per-navigation) kill/resume was considered and
-# rejected: every signal-evaluation function requires exactly
-# MIN_SAMPLE_MATCHES (6) fetched matches before firing anything, so
-# losing even one of a team's 6 match-fetches already makes that
-# team's data unusable for this fixture — there's no partial credit to
-# preserve by being more surgical, so the simpler per-call boundary is
-# equally effective.
-HARD_TIMEOUT_DEFAULT_SEC = int(os.getenv("SCRAPER_HARD_TIMEOUT_DEFAULT_SEC", "90"))
-
-# analyze_team involves one get_team_recent_matches call (bounded by
-# DISCOVER_TIME_BUDGET_SEC) plus up to 6 get_match_statistics calls
-# (each an _api_get bounded by NAV_TIMEOUT_MS if its AbortController
-# fires cleanly, i.e. nothing is actually hung) — legitimate worst case
-# is roughly 60 + 6*45 =~ 330s. Left at the same 480s this was
-# originally set to against Flashscore's DOM-hang investigation, which
-# still gives real margin above that estimate; can likely come down
-# once this has run at scale against the API and shown typical timings.
-HARD_TIMEOUT_ANALYZE_TEAM_SEC = int(
-    os.getenv("SCRAPER_HARD_TIMEOUT_ANALYZE_TEAM_SEC", "480")
-)
-
-HARD_TIMEOUTS_BY_METHOD = {
-    "analyze_team": HARD_TIMEOUT_ANALYZE_TEAM_SEC,
-}
-
-
-def _scraper_worker_main(cmd_queue, result_queue, headless):
-    """
-    Entry point for the persistent scraper worker subprocess (see
-    RemoteScraperHandle). Owns the ONE Chromium browser for as long as
-    this process is alive. A plain module-level function, not a
-    closure or bound method — required so multiprocessing's "spawn"
-    start method (used instead of Linux's default "fork" because
-    Playwright's asyncio/greenlet internals don't survive a fork
-    cleanly) can pickle/import it by reference in the fresh child
-    interpreter.
-
-    Runs in its own process group (os.setpgid) so the parent can kill
-    this process AND whatever it spawned (Chromium) together with
-    os.killpg — SIGKILL-ing just this one PID would leave an orphaned
-    Chromium process behind, quietly reintroducing the exact resource
-    leak the browser-reuse fix exists to avoid.
-    """
-    try:
-        os.setpgid(0, 0)
-    except Exception as e:
-        log.warning(
-            f"Worker could not start its own process group ({e}) — a "
-            f"hard-kill of this worker may leave its browser process "
-            f"orphaned instead of also being killed"
-        )
-
-    scraper = None
-    try:
-        scraper = SofascoreGoalsScraper(headless=headless)
-        while True:
-            item = cmd_queue.get()
-            if item is None or item[0] == "__stop__":
-                break
-
-            call_id, method_name, args, kwargs = item
-            try:
-                method = getattr(scraper, method_name)
-                value = method(*args, **kwargs)
-                result_queue.put((call_id, True, value))
-            except Exception as e:
-                # Exceptions from Playwright internals often aren't
-                # picklable (they can hold connection/transport
-                # references) — send the message across as plain text.
-                result_queue.put((call_id, False, str(e)))
-    finally:
-        if scraper is not None:
-            try:
-                scraper.close()
-            except Exception:
-                pass
-
-
-class RemoteScraperHandle:
-    """
-    Parent-side stand-in for SofascoreGoalsScraper: every method call
-    is transparently forwarded (via __getattr__) to a persistent
-    worker subprocess that actually owns the browser, with a hard,
-    OS-enforced timeout on each call. If the worker doesn't respond in
-    time, it — and its whole process group, including its Chromium —
-    is unconditionally SIGKILLed and immediately replaced with a fresh
-    worker so the batch can continue with the next match. See this
-    module's "SUBPROCESS WATCHDOG" comment for why this needs a real
-    process rather than a thread, and why per-call (not
-    per-navigation) granularity is enough.
-
-    Concurrency stays at exactly one: only one worker is ever alive and
-    doing real work at a time. A kill+respawn is a brief transient
-    moment, not a second worker running alongside the first.
-    """
-
-    def __init__(self, headless):
-        self.headless = headless
-        self._ctx = multiprocessing.get_context("spawn")
-        self._call_counter = 0
-        self.process = None
-        self.cmd_queue = None
-        self.result_queue = None
-        self._spawn_worker()
-
-    def _spawn_worker(self):
-        self.cmd_queue = self._ctx.Queue()
-        self.result_queue = self._ctx.Queue()
-        self.process = self._ctx.Process(
-            target=_scraper_worker_main,
-            args=(self.cmd_queue, self.result_queue, self.headless),
-            daemon=True,
-        )
-        self.process.start()
-        log.info(f"Scraper worker started (pid={self.process.pid})")
-
-    def _kill_worker(self, reason):
-        pid = self.process.pid
-        log.warning(
-            f"Killing scraper worker (pid={pid}) and its process "
-            f"group — {reason}"
-        )
-        try:
-            os.killpg(pid, signal.SIGKILL)
-        except Exception as e:
-            log.warning(
-                f"os.killpg failed ({e}), falling back to killing just "
-                f"the worker process itself — its browser may be left "
-                f"orphaned"
-            )
-            try:
-                self.process.kill()
-            except Exception as e2:
-                log.warning(f"Error killing worker process: {e2}")
-
-        self.process.join(timeout=10)
-
-    def call(self, method_name, *args, **kwargs):
-        self._call_counter += 1
-        call_id = self._call_counter
-        timeout_sec = HARD_TIMEOUTS_BY_METHOD.get(
-            method_name, HARD_TIMEOUT_DEFAULT_SEC
-        )
-
-        self.cmd_queue.put((call_id, method_name, args, kwargs))
-
-        try:
-            _, ok, value = self.result_queue.get(timeout=timeout_sec)
-        except queue.Empty:
-            self._kill_worker(
-                f"{method_name}() exceeded its hard {timeout_sec}s ceiling"
-            )
-            self._spawn_worker()
-            raise TimeoutError(
-                f"{method_name} hard-timed-out after {timeout_sec}s "
-                f"and its worker was killed"
-            )
-
-        if not ok:
-            raise RuntimeError(f"{method_name} failed in worker: {value}")
-
-        return value
-
-    def __getattr__(self, name):
-        # Anything not found as a real attribute on this handle is
-        # treated as a proxied call on the worker's
-        # SofascoreGoalsScraper — so every existing call site that
-        # used to call a SofascoreGoalsScraper method directly
-        # (scraper.analyze_team(...), scraper.discover_matches(...),
-        # etc.) keeps working completely unchanged.
-        def _proxy(*args, **kwargs):
-            return self.call(name, *args, **kwargs)
-        return _proxy
-
-    def close(self):
-        try:
-            self.cmd_queue.put(("__stop__",))
-            self.process.join(timeout=15)
-        except Exception:
-            pass
-
-        if self.process.is_alive():
-            self._kill_worker("did not exit cleanly on close()")
+            log.warning(f"Error closing session: {e}")
 
 
 # ---------------- SIGNAL ENGINE ----------------
@@ -2177,8 +1750,6 @@ def main():
         ""
     ).strip()
 
-    HEADLESS = True
-
     if not BOT_TOKEN or not CHAT_ID:
         # NOTE: cron/systemd/most schedulers do NOT source your shell
         # profile (.bashrc/.profile/.env), so env vars that are visible
@@ -2198,45 +1769,21 @@ def main():
         CHAT_ID
     )
 
-    log.info("Starting Sofascore alert script...")
+    log.info("Starting 365scores alert script...")
     log.info(f"Batch start={START}, limit={LIMIT}")
 
     # Declared before the try block so `finally` can safely check it even
     # if construction itself fails (see below).
     #
-    # HISTORY: this used to scrape Flashscore's DOM. That fought a
-    # stats "tab" that sometimes silently hung for 480-1231+ seconds
-    # with no error — reproduced across three Flashscore domains, and
-    # with or without concurrent browsers, ruling out both a resource
-    # leak and CPU contention as the cause. Migrated to Sofascore's own
-    # internal JSON API instead (see SofascoreGoalsScraper's docstring)
-    # — no DOM clicks, no "tab" to hang on, just plain HTTP GETs with a
-    # real client-side timeout that actually cancels a stuck request.
-    #
-    # `scraper` is a RemoteScraperHandle, not a SofascoreGoalsScraper
-    # directly — every method call below is transparently forwarded to
-    # a persistent worker SUBPROCESS that actually owns the one browser
-    # session (see RemoteScraperHandle / _scraper_worker_main).
-    # Concurrency is still exactly one: nothing here runs two workers
-    # at once. A call that exceeds its hard ceiling gets its worker's
-    # entire process group SIGKILLed and replaced with a fresh one — a
-    # real OS-level kill a thread-based approach can't provide, since
-    # Playwright's sync API can't be called across threads at all (see
-    # the SUBPROCESS WATCHDOG comment above RemoteScraperHandle for why
-    # that was tried and reverted).
+    # No browser, no subprocess watchdog, no worker process to spawn or
+    # recycle — see this module's TUNABLES comment for why. `scraper`
+    # is just a plain requests.Session() wrapper; every call is a
+    # direct HTTP GET with its own retry/timeout handling built in
+    # (see SixtyFiveScoresScraper._api_get).
     scraper = None
 
     try:
-        # Spawning the worker (which itself launches Playwright +
-        # Chromium and establishes a Sofascore session) is now INSIDE
-        # the try block. Previously this happened before the try, so
-        # any launch failure (missing browser binaries, missing OS
-        # deps, sandbox restrictions when run as root under cron, etc.)
-        # crashed the whole process with no "❌ Job FAILED" alert and no
-        # cleanup — you'd only ever see the "🚀 Job STARTED" message.
-        scraper = RemoteScraperHandle(headless=HEADLESS)
-
-        _log_resource_usage("job start, after worker spawn")
+        scraper = SixtyFiveScoresScraper()
 
         matches = scraper.discover_matches(
             TARGET_COUNT,
@@ -2279,11 +1826,10 @@ def main():
         ):
 
             # discover_matches already returns rich dicts (home/away
-            # names AND exact IDs, tournament) straight from Sofascore's
-            # API — unlike the Flashscore version, there's no separate
-            # "visit the match page to read team names/links" step
-            # needed at all.
-            m_url = f"https://www.sofascore.com/event/{match['id']}"
+            # names AND exact IDs, tournament) straight from the API —
+            # no separate "visit the match page to read team
+            # names/links" step needed.
+            m_url = f"https://www.365scores.com/en-uk/football/game/{match['id']}"
             home = match["home_name"]
             away = match["away_name"]
 
@@ -2299,18 +1845,10 @@ def main():
                     )
                     continue
 
-                # Sequential, both through the single `scraper` — see
-                # the note above `scraper = RemoteScraperHandle(...)`
-                # for why. maybe_recycle_browser is the periodic
-                # full-relaunch safety net; new_session gives each
-                # team's analysis a clean session (no cookie carryover)
-                # without paying for a full relaunch to get it.
                 home_error = None
                 away_error = None
 
                 try:
-                    scraper.maybe_recycle_browser()
-                    scraper.new_session()
                     home_data = scraper.analyze_team(
                         match["home_id"], match["home_name"]
                     )
@@ -2319,20 +1857,12 @@ def main():
                     home_error = e
 
                 try:
-                    scraper.maybe_recycle_browser()
-                    scraper.new_session()
                     away_data = scraper.analyze_team(
                         match["away_id"], match["away_name"]
                     )
                 except Exception as e:
                     away_data = None
                     away_error = e
-
-                # Logged after every match — this is the line that shows
-                # whether chrome-family process count / free memory is
-                # holding steady across the batch instead of climbing
-                # (see _log_resource_usage docstring).
-                _log_resource_usage(f"after match {idx}")
 
                 if home_error:
                     log.error(f"Home team analysis failed: {home_error}")
@@ -2427,7 +1957,7 @@ def main():
                     log.info("No signals found.")
 
             except Exception as match_err:
-                # A single bad match (odd page layout, timeout, etc.)
+                # A single bad match (missing data, timeout, etc.)
                 # should not take down the whole batch — log it and
                 # move on to the next match instead.
                 log.error(
@@ -2458,7 +1988,7 @@ def main():
 
     finally:
 
-        log.info("Closing browser...")
+        log.info("Closing scraper session...")
 
         if scraper is not None:
             scraper.close()
