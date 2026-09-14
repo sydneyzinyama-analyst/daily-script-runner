@@ -269,7 +269,7 @@ class SixtyFiveScoresScraper:
         return matches
 
     # ---------------- TEAM HISTORY ----------------
-    def get_team_recent_matches(self, team_id, count=6):
+    def get_team_recent_matches(self, team_id, count=5):
         """
         Returns up to `count` of this team's most recent FINISHED
         matches, each a light dict (id, home_id, home_name, away_id,
@@ -462,7 +462,7 @@ class SixtyFiveScoresScraper:
     # ---------------- SCRAPER ----------------
     def analyze_team(self, team_id, team_name=None):
         """
-        Fetches this team's last 6 finished matches, each one's
+        Fetches this team's last 5 finished matches, each one's
         statistics, and returns the same stats dict shape the
         (unchanged) signal-evaluation functions expect — the only
         thing they care about is the abstract dict shape, not where
@@ -472,7 +472,7 @@ class SixtyFiveScoresScraper:
         self.team_id = team_id
         self.team_name = team_name or str(team_id)
 
-        recent = self.get_team_recent_matches(team_id, count=6)
+        recent = self.get_team_recent_matches(team_id, count=5)
         results = []
         for m in recent:
             match_stats = self.get_match_statistics(
@@ -483,7 +483,7 @@ class SixtyFiveScoresScraper:
             results.append(match_data)
 
         log.info(
-            f"analyze_team({self.team_name!r}): {len(results)}/6 "
+            f"analyze_team({self.team_name!r}): {len(results)}/5 "
             f"matches fetched in {time.time()-t0:.1f}s total"
         )
 
@@ -570,9 +570,9 @@ class SixtyFiveScoresScraper:
 # happen".
 
 # Every signal requires each team's stats to be built from at least
-# this many of the up-to-6 fetched recent matches. Below this, the
+# this many of the up-to-5 fetched recent matches. Below this, the
 # sample is too thin to trust any prediction on it.
-MIN_SAMPLE_MATCHES = 6
+MIN_SAMPLE_MATCHES = 5
 
 # The literal target: home win margin (goals for - goals against).
 MARGIN_TARGET = 2.0
@@ -1791,7 +1791,7 @@ def main():
             # spending a full analysis on a match that's already live
             # or finished. Left False (default) everywhere else
             # discover_matches is called — e.g. inside analyze_team,
-            # pulling a team's past 6 results, which are *supposed* to
+            # pulling a team's past 5 results, which are *supposed* to
             # already be finished.
             only_upcoming=True
         )
