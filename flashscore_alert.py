@@ -1772,8 +1772,9 @@ def main():
     log.info("Starting 365scores alert script...")
     log.info(f"Batch start={START}, limit={LIMIT}")
 
-    # Declared before the try block so `finally` can safely check it even
-    # if construction itself fails (see below).
+    # Declared before the try block so `finally` (and the FAILED status
+    # message below) can safely reference them even if construction, or
+    # discovery itself, fails before the analysis loop is ever reached.
     #
     # No browser, no subprocess watchdog, no worker process to spawn or
     # recycle — see this module's TUNABLES comment for why. `scraper`
@@ -1781,6 +1782,8 @@ def main():
     # direct HTTP GET with its own retry/timeout handling built in
     # (see SixtyFiveScoresScraper._api_get).
     scraper = None
+    matches = []
+    analyzed_count = 0
 
     try:
         scraper = SixtyFiveScoresScraper()
@@ -1813,12 +1816,20 @@ def main():
 
             send_job_status(
                 f"⚠️ Job FINISHED (No matches)\n"
-                f"Batch START={START} LIMIT={LIMIT}",
+                f"Batch START={START} LIMIT={LIMIT}\n"
+                f"Found {len(matches)} matches today, 0 fell in this "
+                f"batch's range",
                 BOT_TOKEN,
                 CHAT_ID
             )
 
             return
+
+        # analyzed_count (declared above, before the try block) counts
+        # what's reported back at the end — distinct from
+        # len(batch_matches): a match only counts as "analyzed" once
+        # both teams' stats were successfully pulled, not just
+        # attempted (see the home_data/away_data check below).
 
         for idx, match in enumerate(
             batch_matches,
@@ -1878,6 +1889,8 @@ def main():
                     )
 
                     continue
+
+                analyzed_count += 1
 
                 # Independent predictions per match — each can fire or
                 # not fire on its own (e.g. a predicted 1-0 fires the
@@ -1966,9 +1979,16 @@ def main():
                 log.debug(traceback.format_exc())
                 continue
 
+        log.info(
+            f"Analyzed {analyzed_count}/{len(batch_matches)} matches "
+            f"in this batch (found {len(matches)} total today)"
+        )
+
         send_job_status(
             f"✅ Job FINISHED\n"
-            f"Batch START={START} LIMIT={LIMIT}",
+            f"Batch START={START} LIMIT={LIMIT}\n"
+            f"Found {len(matches)} matches today, analyzed "
+            f"{analyzed_count}/{len(batch_matches)} in this batch",
             BOT_TOKEN,
             CHAT_ID
         )
@@ -1981,6 +2001,8 @@ def main():
         send_job_status(
             f"❌ Job FAILED\n"
             f"Batch START={START} LIMIT={LIMIT}\n"
+            f"Found {len(matches)} matches today, analyzed "
+            f"{analyzed_count} before failing\n"
             f"Error: {str(e)}",
             BOT_TOKEN,
             CHAT_ID
