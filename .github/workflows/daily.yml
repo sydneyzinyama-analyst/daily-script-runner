@@ -35,4 +35,4 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
           START=$(( ${{ matrix.batch }} * 100 ))
-           python flashscore_alert.py --start $START --limit 100 --backtest --date 13/09/2026
+           python flashscore_alert.py --start $START --limit 100 
