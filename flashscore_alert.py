@@ -1065,9 +1065,426 @@ def evaluate_away_margin_signal(home, away, home_data, away_data, m_url):
 
 
 # -------------------------------------------------
+# HOME/AWAY ADVANTAGE PREDICTION
+# -------------------------------------------------
+# Second, independent prediction: does one side simply look like the
+# better team on paper — deliberately much looser than the margin
+# signal above. That one claims a specific scoreline shape (2+ goals)
+# and gates on it with a buffered expected-margin calculation plus a
+# corroboration score; this one claims nothing about the final
+# scoreline at all, just "this team is ahead of the other on every one
+# of four raw averages" (goals scored, shots taken, possession,
+# defense). No buffers, no scoring threshold — every one of the four
+# has to hold, but each is a plain > or < comparison, which is a much
+# easier bar to clear than MARGIN_SCORE_THRESHOLD. Independent of every
+# other signal here: a match can fire this alongside the margin signal
+# (the stronger team also happens to be strong enough to clear the 2+
+# bar), on its own (ahead on paper but not by enough to also fire the
+# stricter signal), or not at all.
+
+def _stronger_on_all_fronts(
+    team_goals, opp_goals,
+    team_shots, opp_shots,
+    team_poss, opp_poss,
+    team_gc, opp_gc,
+):
+    """
+    True only if "team" clears ALL FOUR of: scores more goals, takes
+    more shots, holds more possession, and has the stronger defense
+    (concedes fewer goals) than "opp", using each side's own recent-
+    form averages directly — not the blended for+against expectation
+    every other signal in this script uses. No partial credit: any one
+    of the four not holding fails the whole check.
+
+    Requires every input present — missing shots/possession data
+    (common on minor-league matches, see STAT_NAME_MAP comment) means
+    this can't evaluate that dimension at all, so it fails closed
+    rather than silently dropping it and deciding on the rest.
+    """
+    if None in (
+        team_goals, opp_goals,
+        team_shots, opp_shots,
+        team_poss, opp_poss,
+        team_gc, opp_gc,
+    ):
+        return False
+
+    return (
+        team_goals > opp_goals
+        and team_shots > opp_shots
+        and team_poss > opp_poss
+        and team_gc < opp_gc
+    )
+
+
+# Corroboration bar on top of _stronger_on_all_fronts' hard gate — see
+# _advantage_score. Max achievable is 5.5 (1 SoT + 1 big chances + 0.5
+# corners + 1 xG + 1 xGA + 0.5 own keeper outperforming + 0.5
+# opponent's keeper leaky); kept well under half of that so this stays
+# a genuinely loose signal, not the margin signal's severity again.
+ADVANTAGE_SCORE_THRESHOLD = 2.0
+
+
+def _advantage_score(
+    team_sot_for, opp_sot_for,
+    team_bc_for, opp_bc_for,
+    team_corners_for, opp_corners_for,
+    team_xg, opp_xg,
+    team_xga, opp_xga,
+    team_gp, opp_gp,
+):
+    """
+    Extra corroboration on top of _stronger_on_all_fronts' hard gate
+    (goals/shots/possession/defense) — folds in every stat that gate
+    doesn't touch: shots on target, big chances created, corners, xG
+    and xGA (shot-quality-adjusted versions of the raw goals/defense
+    comparison the hard gate already made), and each goalkeeper's own
+    record (goals prevented). Every comparison here is a plain >/<
+    check worth partial credit, not another hard requirement — same
+    for+for-only shape as the rest of this signal (team's own rate vs
+    opponent's own rate, not the blended for+against expectation the
+    margin/clean-sheet/under-goals signals use), since the point is
+    extra confirmation on top of an already-directional hard gate, not
+    turning this back into "wins on literally everything". All args
+    None-safe — a missing stat just contributes nothing, matching
+    _margin_score/_clean_sheet_score/_under_goals_score elsewhere in
+    this script.
+    """
+    score = 0.0
+
+    if team_sot_for is not None and opp_sot_for is not None and team_sot_for > opp_sot_for:
+        score += 1
+
+    if team_bc_for is not None and opp_bc_for is not None and team_bc_for > opp_bc_for:
+        score += 1
+
+    if team_corners_for is not None and opp_corners_for is not None and team_corners_for > opp_corners_for:
+        score += 0.5
+
+    # xG/xGA corroborate the raw goals/defense comparison the hard
+    # gate already made with a shot-quality-adjusted version of the
+    # same claim — team creating better chances than the opponent, and
+    # conceding worse ones, independent of how the actual goals landed.
+    if team_xg is not None and opp_xg is not None and team_xg > opp_xg:
+        score += 1
+
+    if team_xga is not None and opp_xga is not None and team_xga < opp_xga:
+        score += 1
+
+    if team_gp is not None and team_gp >= 0.2:
+        score += 0.5
+
+    if opp_gp is not None and opp_gp <= -0.2:
+        score += 0.5
+
+    return score
+
+
+def evaluate_home_advantage_signal(home, away, home_data, away_data, m_url):
+    """
+    Returns a Telegram-ready message if HOME is ahead of AWAY on all
+    four of: goals scored, shots taken, possession, and defense (goals
+    conceded), AND clears ADVANTAGE_SCORE_THRESHOLD worth of
+    corroboration from the rest of the stats (SoT, big chances,
+    corners, xG/xGA, goalkeeper record — see _advantage_score) — or
+    None if either bar isn't cleared. Mirrored by
+    evaluate_away_advantage_signal below for the away side.
+    """
+    home = _escape_markdown(home)
+    away = _escape_markdown(away)
+
+    hs = home_data["stats"]
+    as_ = away_data["stats"]
+
+    if (
+        hs.get("matches", 0) < MIN_SAMPLE_MATCHES
+        or as_.get("matches", 0) < MIN_SAMPLE_MATCHES
+    ):
+        return None
+
+    h_g = hs.get("avg_goals", 0)
+    a_g = as_.get("avg_goals", 0)
+
+    h_gc = hs.get("avg_gc", 0)
+    a_gc = as_.get("avg_gc", 0)
+
+    h_xg = hs.get("avg_xg")
+    a_xg = as_.get("avg_xg")
+
+    h_xga = hs.get("avg_xga")
+    a_xga = as_.get("avg_xga")
+
+    h_corners_for = hs.get("avg_corners_for")
+    h_corners_against = hs.get("avg_corners_against")
+    a_corners_for = as_.get("avg_corners_for")
+    a_corners_against = as_.get("avg_corners_against")
+
+    h_bc_for = hs.get("avg_big_chances_for")
+    h_bc_against = hs.get("avg_big_chances_against")
+    a_bc_for = as_.get("avg_big_chances_for")
+    a_bc_against = as_.get("avg_big_chances_against")
+
+    h_cards = hs.get("avg_yellow_cards")
+    a_cards = as_.get("avg_yellow_cards")
+    h_fouls = hs.get("avg_fouls")
+    a_fouls = as_.get("avg_fouls")
+
+    h_gp = hs.get("avg_goals_prevented")
+    a_gp = as_.get("avg_goals_prevented")
+
+    h_shots_for = hs.get("avg_shots_for")
+    h_shots_against = hs.get("avg_shots_against")
+    a_shots_for = as_.get("avg_shots_for")
+    a_shots_against = as_.get("avg_shots_against")
+
+    h_sot_for = hs.get("avg_sot_for")
+    h_sot_against = hs.get("avg_sot_against")
+    a_sot_for = as_.get("avg_sot_for")
+    a_sot_against = as_.get("avg_sot_against")
+
+    h_poss = hs.get("avg_possession")
+    a_poss = as_.get("avg_possession")
+
+    if not _stronger_on_all_fronts(
+        h_g, a_g,
+        h_shots_for, a_shots_for,
+        h_poss, a_poss,
+        h_gc, a_gc,
+    ):
+        return None
+
+    advantage_score = _advantage_score(
+        h_sot_for, a_sot_for,
+        h_bc_for, a_bc_for,
+        h_corners_for, a_corners_for,
+        h_xg, a_xg,
+        h_xga, a_xga,
+        h_gp, a_gp,
+    )
+
+    if advantage_score < ADVANTAGE_SCORE_THRESHOLD:
+        return None
+
+    # -------------------------------------------------
+    # RISK FACTORS (shown, don't block the prediction)
+    # -------------------------------------------------
+    # xG/xGA already feed the corroboration score above, so a
+    # disagreement there would normally have already cost points
+    # toward the threshold — these risk notes are for the case where
+    # the score still cleared despite one of them disagreeing (e.g.
+    # other stats compensated), worth surfacing even though it didn't
+    # block the prediction.
+
+    risks = []
+
+    if h_xg is not None and a_xg is not None and a_xg >= h_xg:
+        risks.append(
+            f"{away}'s underlying shot quality (xG {a_xg}) is actually "
+            f"on par with or ahead of {home}'s ({h_xg}) despite the "
+            f"raw stats favoring {home} — the edge may be thinner than "
+            f"it looks"
+        )
+
+    if h_xga is not None and a_xga is not None and h_xga >= a_xga:
+        risks.append(
+            f"{home} has been conceding chances of similar or worse "
+            f"quality than {away} (xGA {h_xga} vs {a_xga}) despite "
+            f"conceding fewer actual goals — that gap may not hold"
+        )
+
+    # -------------------------------------------------
+    # MESSAGE
+    # -------------------------------------------------
+
+    def fmt(v):
+        return "N/A" if v is None else str(v)
+
+    lines = [
+        f"⚽ *{home} vs {away}*",
+        "",
+        f"📈 *Prediction: {home} has the edge* "
+        f"(more goals, more shots, more possession, stronger defense)",
+        f"G {h_g} vs {a_g} | Shots {h_shots_for} vs {a_shots_for} | "
+        f"Poss {h_poss}% vs {a_poss}% | GA {h_gc} vs {a_gc} "
+        f"| corroboration score {advantage_score:.1f}",
+        "",
+        "📊 *Stats*",
+        f"{home}   G {h_g} | GA {h_gc} | xG {fmt(h_xg)} | xGA {fmt(h_xga)}",
+        f"{away}   G {a_g} | GA {a_gc} | xG {fmt(a_xg)} | xGA {fmt(a_xga)}",
+        f"Possession {fmt(h_poss)}% vs {fmt(a_poss)}%",
+        f"Shots {fmt(h_shots_for)}/{fmt(h_shots_against)} vs "
+        f"{fmt(a_shots_for)}/{fmt(a_shots_against)} | "
+        f"SoT {fmt(h_sot_for)}/{fmt(h_sot_against)} vs "
+        f"{fmt(a_sot_for)}/{fmt(a_sot_against)}",
+        f"Corners {fmt(h_corners_for)}/{fmt(h_corners_against)} vs "
+        f"{fmt(a_corners_for)}/{fmt(a_corners_against)} | "
+        f"BigCh {fmt(h_bc_for)}/{fmt(h_bc_against)} vs "
+        f"{fmt(a_bc_for)}/{fmt(a_bc_against)}",
+        f"Cards {fmt(h_cards)} vs {fmt(a_cards)} | "
+        f"Fouls {fmt(h_fouls)} vs {fmt(a_fouls)} | "
+        f"GP {fmt(h_gp)} vs {fmt(a_gp)}",
+        "",
+    ]
+
+    if risks:
+        lines.append(f"⚠️ *Risk factors ({len(risks)})*")
+        lines.extend(f"• {r}" for r in risks)
+        lines.append("")
+
+    lines.append(f"🔗 {m_url}")
+
+    return "\n".join(lines)
+
+
+def evaluate_away_advantage_signal(home, away, home_data, away_data, m_url):
+    """
+    Mirror image of evaluate_home_advantage_signal: returns a message
+    if AWAY is ahead of HOME on all four of goals scored, shots taken,
+    possession, and defense, AND clears ADVANTAGE_SCORE_THRESHOLD
+    worth of corroboration from the rest of the stats, or None if
+    either bar isn't cleared.
+    """
+    home = _escape_markdown(home)
+    away = _escape_markdown(away)
+
+    hs = home_data["stats"]
+    as_ = away_data["stats"]
+
+    if (
+        hs.get("matches", 0) < MIN_SAMPLE_MATCHES
+        or as_.get("matches", 0) < MIN_SAMPLE_MATCHES
+    ):
+        return None
+
+    h_g = hs.get("avg_goals", 0)
+    a_g = as_.get("avg_goals", 0)
+
+    h_gc = hs.get("avg_gc", 0)
+    a_gc = as_.get("avg_gc", 0)
+
+    h_xg = hs.get("avg_xg")
+    a_xg = as_.get("avg_xg")
+
+    h_xga = hs.get("avg_xga")
+    a_xga = as_.get("avg_xga")
+
+    h_corners_for = hs.get("avg_corners_for")
+    h_corners_against = hs.get("avg_corners_against")
+    a_corners_for = as_.get("avg_corners_for")
+    a_corners_against = as_.get("avg_corners_against")
+
+    h_bc_for = hs.get("avg_big_chances_for")
+    h_bc_against = hs.get("avg_big_chances_against")
+    a_bc_for = as_.get("avg_big_chances_for")
+    a_bc_against = as_.get("avg_big_chances_against")
+
+    h_cards = hs.get("avg_yellow_cards")
+    a_cards = as_.get("avg_yellow_cards")
+    h_fouls = hs.get("avg_fouls")
+    a_fouls = as_.get("avg_fouls")
+
+    h_gp = hs.get("avg_goals_prevented")
+    a_gp = as_.get("avg_goals_prevented")
+
+    h_shots_for = hs.get("avg_shots_for")
+    h_shots_against = hs.get("avg_shots_against")
+    a_shots_for = as_.get("avg_shots_for")
+    a_shots_against = as_.get("avg_shots_against")
+
+    h_sot_for = hs.get("avg_sot_for")
+    h_sot_against = hs.get("avg_sot_against")
+    a_sot_for = as_.get("avg_sot_for")
+    a_sot_against = as_.get("avg_sot_against")
+
+    h_poss = hs.get("avg_possession")
+    a_poss = as_.get("avg_possession")
+
+    if not _stronger_on_all_fronts(
+        a_g, h_g,
+        a_shots_for, h_shots_for,
+        a_poss, h_poss,
+        a_gc, h_gc,
+    ):
+        return None
+
+    advantage_score = _advantage_score(
+        a_sot_for, h_sot_for,
+        a_bc_for, h_bc_for,
+        a_corners_for, h_corners_for,
+        a_xg, h_xg,
+        a_xga, h_xga,
+        a_gp, h_gp,
+    )
+
+    if advantage_score < ADVANTAGE_SCORE_THRESHOLD:
+        return None
+
+    # xG/xGA already feed the corroboration score above (see
+    # evaluate_home_advantage_signal's matching comment) — these risk
+    # notes cover the case where the score still cleared despite one
+    # of them disagreeing.
+
+    risks = []
+
+    if a_xg is not None and h_xg is not None and h_xg >= a_xg:
+        risks.append(
+            f"{home}'s underlying shot quality (xG {h_xg}) is actually "
+            f"on par with or ahead of {away}'s ({a_xg}) despite the "
+            f"raw stats favoring {away} — the edge may be thinner than "
+            f"it looks"
+        )
+
+    if a_xga is not None and h_xga is not None and a_xga >= h_xga:
+        risks.append(
+            f"{away} has been conceding chances of similar or worse "
+            f"quality than {home} (xGA {a_xga} vs {h_xga}) despite "
+            f"conceding fewer actual goals — that gap may not hold"
+        )
+
+    def fmt(v):
+        return "N/A" if v is None else str(v)
+
+    lines = [
+        f"⚽ *{home} vs {away}*",
+        "",
+        f"📈 *Prediction: {away} has the edge* "
+        f"(more goals, more shots, more possession, stronger defense)",
+        f"G {a_g} vs {h_g} | Shots {a_shots_for} vs {h_shots_for} | "
+        f"Poss {a_poss}% vs {h_poss}% | GA {a_gc} vs {h_gc} "
+        f"| corroboration score {advantage_score:.1f}",
+        "",
+        "📊 *Stats*",
+        f"{home}   G {h_g} | GA {h_gc} | xG {fmt(h_xg)} | xGA {fmt(h_xga)}",
+        f"{away}   G {a_g} | GA {a_gc} | xG {fmt(a_xg)} | xGA {fmt(a_xga)}",
+        f"Possession {fmt(h_poss)}% vs {fmt(a_poss)}%",
+        f"Shots {fmt(h_shots_for)}/{fmt(h_shots_against)} vs "
+        f"{fmt(a_shots_for)}/{fmt(a_shots_against)} | "
+        f"SoT {fmt(h_sot_for)}/{fmt(h_sot_against)} vs "
+        f"{fmt(a_sot_for)}/{fmt(a_sot_against)}",
+        f"Corners {fmt(h_corners_for)}/{fmt(h_corners_against)} vs "
+        f"{fmt(a_corners_for)}/{fmt(a_corners_against)} | "
+        f"BigCh {fmt(h_bc_for)}/{fmt(h_bc_against)} vs "
+        f"{fmt(a_bc_for)}/{fmt(a_bc_against)}",
+        f"Cards {fmt(h_cards)} vs {fmt(a_cards)} | "
+        f"Fouls {fmt(h_fouls)} vs {fmt(a_fouls)} | "
+        f"GP {fmt(h_gp)} vs {fmt(a_gp)}",
+        "",
+    ]
+
+    if risks:
+        lines.append(f"⚠️ *Risk factors ({len(risks)})*")
+        lines.extend(f"• {r}" for r in risks)
+        lines.append("")
+
+    lines.append(f"🔗 {m_url}")
+
+    return "\n".join(lines)
+
+
+# -------------------------------------------------
 # HOME CLEAN SHEET PREDICTION
 # -------------------------------------------------
-# Second, independent prediction: HOME team keeps a clean sheet (away
+# Third, independent prediction: HOME team keeps a clean sheet (away
 # team fails to score). Same strictness philosophy and for+against
 # blended-expectation approach as the margin prediction above — full
 # sample, a buffered expected-goals gate, corroboration from the extra
@@ -1296,7 +1713,7 @@ def evaluate_home_clean_sheet_signal(home, away, home_data, away_data, m_url):
 # -------------------------------------------------
 # TEAM TOTAL GOALS UNDER 1.5 PREDICTION
 # -------------------------------------------------
-# Third, independent prediction: does HOME's own total, or AWAY's own
+# Fourth, independent prediction: does HOME's own total, or AWAY's own
 # total, come in under 1.5 goals — checked separately per side, using
 # the same expected-own-goals blend as the margin/clean-sheet signals
 # (own attacking rate blended with the opponent's own defensive
@@ -1541,7 +1958,7 @@ def evaluate_team_under_1_5_signal(home, away, home_data, away_data, m_url):
 # -------------------------------------------------
 # MATCH TOTAL GOALS UNDER 1.5 PREDICTION
 # -------------------------------------------------
-# Fourth, independent prediction: the classic combined match total
+# Fifth, independent prediction: the classic combined match total
 # (home + away goals together) under 1.5 — distinct from
 # evaluate_team_under_1_5_signal, which checks each side's *own*
 # total separately. Reuses _under_goals_score from that signal for
@@ -1914,6 +2331,22 @@ def main():
                     m_url
                 )
 
+                home_advantage_msg = evaluate_home_advantage_signal(
+                    home,
+                    away,
+                    home_data,
+                    away_data,
+                    m_url
+                )
+
+                away_advantage_msg = evaluate_away_advantage_signal(
+                    home,
+                    away,
+                    home_data,
+                    away_data,
+                    m_url
+                )
+
                 clean_sheet_msg = evaluate_home_clean_sheet_signal(
                     home,
                     away,
@@ -1945,6 +2378,8 @@ def main():
                 fired_signals = [
                     ("home margin", margin_msg),
                     ("away margin", away_margin_msg),
+                    ("home advantage", home_advantage_msg),
+                    ("away advantage", away_advantage_msg),
                     ("clean sheet", clean_sheet_msg),
                     # Bet framed as Under 2.5 — the underlying check is
                     # still verified to a stricter Under 1.5 bar first
